@@ -189,3 +189,61 @@ fn mismatched_session_root_cannot_decrypt() {
     let pkt = tx.send(b"hello");
     assert_eq!(rx.recv(&pkt).unwrap_err(), ReceiveError::AuthenticationFailed);
 }
+
+/// 加密原语白盒验证：逐条核对 crypto.rs 的实现性质。
+#[test]
+fn crypto_layer_properties_hold() {
+    use c_universe::crypto;
+
+    // ① HKDF 根种子：确定性 —— 相同输入必得相同输出。
+    let dh = c_universe::handshake::random_bytes_32();
+    let salt = c_universe::handshake::random_bytes_32();
+    let a = crypto::derive_session_root(&dh, &salt);
+    let b = crypto::derive_session_root(&dh, &salt);
+    assert_eq!(a, b);
+    // 换盐则根种子不同（盐承担会话随机化）。
+    let salt2 = {
+        let mut s = salt;
+        s[0] ^= 1;
+        s
+    };
+    assert_ne!(a, crypto::derive_session_root(&dh, &salt2));
+
+    // ② 逐包密钥：不同 coord 派生不同 K_n（序号隔离，报错不改跨包）。
+    let k0 = crypto::derive_packet_key(&a, 0);
+    let k1 = crypto::derive_packet_key(&a, 1);
+    assert_ne!(k0, k1);
+
+    // ③ nonce 与密钥一一对应（同 coord 恒同 nonce，不同 coord 必不同）。
+    assert_eq!(crypto::coord_to_nonce(7), crypto::coord_to_nonce(7));
+    assert_ne!(crypto::coord_to_nonce(7), crypto::coord_to_nonce(8));
+
+    // ④ AEAD 往返：seal 后 open 能还原明文。
+    let body = b"classified payload";
+    let aad = b"version|coord=0";
+    let nonce = crypto::coord_to_nonce(0);
+    let key = crypto::derive_packet_key(&a, 0);
+    let ct = crypto::seal(&key, &nonce, aad, body);
+    assert_eq!(crypto::open(&key, &nonce, aad, &ct).unwrap(), body);
+
+    // ⑤ 明文隐藏：密文里不能出现任何明文字节。
+    assert_eq!(ct.windows(body.len()).any(|w| w == body), false);
+    assert_ne!(ct, body);
+
+    // ⑥ 错钥失败：换一个密钥 open 必失败。
+    let other_key = crypto::derive_packet_key(&a, 1);
+    assert!(crypto::open(&other_key, &nonce, aad, &ct).is_err());
+
+    // ⑦ AAD 绑定：改头部（AAD）一个字节即认证失败（防改序号/版本）。
+    let aad2 = b"version|coord=1";
+    assert!(crypto::open(&key, &nonce, aad2, &ct).is_err());
+
+    // ⑧ 篡改密文任一位 → 认证失败（完整性）。
+    let mut forged = ct.clone();
+    forged[0] ^= 0x01;
+    assert!(crypto::open(&key, &nonce, aad, &forged).is_err());
+
+    // ⑨ nonce 错配也失败（防 nonce 重排攻击）。
+    let nonce2 = crypto::coord_to_nonce(1);
+    assert!(crypto::open(&key, &nonce2, aad, &ct).is_err());
+}
