@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use c_universe::handshake::random_bytes_32;
+use c_universe::handshake::{random_bytes_32, HandshakeError};
 use c_universe::packet::Packet;
 use c_universe::{ReceiveError, Receiver, SessionConfig};
 
@@ -124,4 +124,45 @@ fn hardened_mega_coord_jump_is_bounded() {
         rx.recv(&Packet::new(&root, 500_000, b"far")).unwrap_err(),
         ReceiveError::Voided(500_000)
     );
+}
+
+/// 攻击 ④ —— 握手层低阶点注入（破解密钥磋商）。
+///
+/// 若能向密钥磋商注入 X25519 **低阶点**公钥（如 `u=0` / `u=1`），
+/// 双方会派生出**全零共享密钥** `S₀=[0;32]`，攻击者据此可预测整条会话，
+/// 重放 / 伪造任意报文。这正是上次加固（RFC 7748 校验）要封死的口子。
+///
+/// 断言：`derive_session_root_with_salt` 遇到低阶点公钥必须返回
+/// `WeakDhSecret`，而不是静默产出可预测密钥。
+#[test]
+fn attack_low_order_point_injection_rejected() {
+    use c_universe::handshake::DhKeyPair;
+    use c_universe::crypto;
+
+    let kp = DhKeyPair::generate();
+    let my_salt = random_bytes_32();
+    let peer_salt = random_bytes_32();
+    let combined = crypto::combine_session_salts(&my_salt, &peer_salt);
+
+    // 已知低阶点：u=0（全零公钥），RFC 7748 标准 X25519 下共享密钥恒为零。
+    let low_order_zero = [0u8; 32];
+    let err = kp
+        .derive_session_root_with_salt(&low_order_zero, &combined)
+        .unwrap_err();
+    assert_eq!(err, HandshakeError::WeakDhSecret);
+
+    // 已知低阶点：u=1（序号=1 的低阶点），输出同样被解算为零。
+    let mut low_order_one = [0u8; 32];
+    low_order_one[0] = 1;
+    let err = kp
+        .derive_session_root_with_salt(&low_order_one, &combined)
+        .unwrap_err();
+    assert_eq!(err, HandshakeError::WeakDhSecret);
+
+    // 对照：正常公钥必须仍能派生出非零根种子，证明校验只拦低阶点。
+    let legit_pub = DhKeyPair::generate().public_key();
+    let root = kp
+        .derive_session_root_with_salt(&legit_pub, &combined)
+        .unwrap();
+    assert_ne!(root, [0u8; 32]);
 }

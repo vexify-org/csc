@@ -32,8 +32,8 @@ fn handshake_reaches_common_root() {
     let combined_a = crypto::combine_session_salts(&salt_a, &salt_b);
     let combined_b = crypto::combine_session_salts(&salt_a, &salt_b);
 
-    let root_a = ka.derive_session_root_with_salt(&pub_b, &combined_a);
-    let root_b = kb.derive_session_root_with_salt(&pub_a, &combined_b);
+    let root_a = ka.derive_session_root_with_salt(&pub_b, &combined_a).unwrap();
+    let root_b = kb.derive_session_root_with_salt(&pub_a, &combined_b).unwrap();
 
     assert_eq!(root_a, root_b);
     assert_ne!(root_a, [0u8; 32]);

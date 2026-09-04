@@ -22,6 +22,9 @@ pub enum HandshakeError {
     /// 对端 DH 载荷长度非法（必须恰好 64 字节 = public_key(32) || salt(32)）。
     #[error("invalid peer payload length {0} (expected 64)")]
     BadPeerPayload(usize),
+    /// X25519 派生出全零共享密钥（对端公钥为低阶点），握手被强制拒绝。
+    #[error("weak/zero DH shared secret (low-order peer public key)")]
+    WeakDhSecret,
 }
 
 /// 一方在一次握手中的地位。
@@ -68,17 +71,29 @@ impl DhKeyPair {
         f
     }
 
+    /// 暴露原始 X25519 共享密钥（用于审计验证；正常流程请走
+    /// [`DhKeyPair::derive_session_root_with_salt`] 的校验路径）。
+    pub fn dh_shared_secret(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+        let peer = x25519_dalek::PublicKey::from(*peer_public);
+        self.secret.diffie_hellman(&peer).to_bytes()
+    }
+
     /// 以对方公钥 + 双方拼接的会话盐派生会话根种子 `S₀`。
-    /// 仅在 QUIC-TLS 校验完成、确认对方是可信对端后方可调用。
+    ///
+    /// 执行 RFC 7748 规定的最低限校验：拒绝产生全零共享密钥的低阶点公钥，
+    /// 避免握手被注入弱密钥。仅在 QUIC-TLS 校验完成、确认对方是可信对端后方可调用。
     pub fn derive_session_root_with_salt(
         &self,
         peer_public: &[u8; 32],
         session_salt: &[u8],
-    ) -> [u8; KEY_LEN] {
+    ) -> Result<[u8; KEY_LEN], HandshakeError> {
         let peer = x25519_dalek::PublicKey::from(*peer_public);
         let dh = self.secret.diffie_hellman(&peer);
         let raw: [u8; 32] = dh.to_bytes();
-        crypto::derive_session_root(&raw, session_salt)
+        if is_all_zero(&raw) {
+            return Err(HandshakeError::WeakDhSecret);
+        }
+        Ok(crypto::derive_session_root(&raw, session_salt))
     }
 }
 
@@ -92,6 +107,11 @@ pub fn parse_peer_frame(frame: &[u8]) -> Result<([u8; 32], [u8; 32]), HandshakeE
     peer_pub.copy_from_slice(&frame[..32]);
     peer_salt.copy_from_slice(&frame[32..64]);
     Ok((peer_pub, peer_salt))
+}
+
+/// RFC 7748：拒绝全零共享密钥，避免低阶点注入弱密钥。
+fn is_all_zero(bytes: &[u8; 32]) -> bool {
+    bytes.iter().all(|&b| b == 0)
 }
 
 /// 生成 32 字节密码学安全随机数（用于会话盐等一次性随机值）。
@@ -148,7 +168,7 @@ where
         Role::Initiator => crypto::combine_session_salts(&salt, &peer_salt),
         Role::Responder => crypto::combine_session_salts(&peer_salt, &salt),
     };
-    let root = kp.derive_session_root_with_salt(&peer_pub, &combined);
+    let root = kp.derive_session_root_with_salt(&peer_pub, &combined)?;
     Ok((kp, root, salt))
 }
 
