@@ -57,6 +57,8 @@ pub struct Receiver {
     used: HashSet<u64>,
     /// 空缺等待窗口：coord -> 截止时刻。
     pending: HashMap<u64, Instant>,
+    /// 空缺窗口已超时、被永久作废的 coord（墓碑，防 retain 清理后复活）。
+    voided: HashSet<u64>,
     /// 已连续收到的最大 coord（无缺口的边界）。
     last_contiguous: i128,
     /// 最近一次成功解密业务包的时刻（50s 熔断计时基准）。
@@ -71,6 +73,7 @@ impl Receiver {
             cfg,
             used: HashSet::new(),
             pending: HashMap::new(),
+            voided: HashSet::new(),
             last_contiguous: -1,
             last_received: None,
         }
@@ -123,9 +126,16 @@ impl Receiver {
             return Err(ReceiveError::Replay(coord));
         }
 
+        // 墓碑：曾开窗口、已超时作废的 coord，永久拒绝（即使已从 pending 清理）。
+        if self.voided.contains(&coord) {
+            return Err(ReceiveError::Voided(coord));
+        }
+
         // 第二层：空缺窗口已超时的 coord 永久作废。
         if let Some(deadline) = self.pending.get(&coord) {
             if *deadline <= now {
+                self.voided.insert(coord);
+                self.pending.remove(&coord);
                 return Err(ReceiveError::Voided(coord));
             }
         }
@@ -155,13 +165,30 @@ impl Receiver {
             }
         }
 
-        // 清理已到的 pending 条目，避免无限增长。
+        // 清理已到的 pending 条目。
         self.pending.remove(&coord);
-
-        // 顺带清理已过期且不再被需要的窗口（可选，节约内存）。
-        self.pending.retain(|_, deadline| *deadline > now);
+        // 过期窗口移入墓碑；清理低于连续边界的旧数据（其已被 `used` 覆盖）。
+        self.evict_expired(now);
 
         Ok(plaintext)
+    }
+
+    /// 把已过期的空缺窗口移入墓碑（永久作废），并按连续边界收缩老旧数据。
+    fn evict_expired(&mut self, now: Instant) {
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(&c, _)| c)
+            .collect();
+        for c in expired {
+            self.voided.insert(c);
+            self.pending.remove(&c);
+        }
+        // coord <= last_contiguous 的必已被 `used` 收纳，墓碑/pending 从此刻可释放。
+        let bound = self.last_contiguous;
+        self.voided.retain(|&c| c > bound as u64);
+        self.pending.retain(|&c, _| c > bound as u64);
     }
 }
 
