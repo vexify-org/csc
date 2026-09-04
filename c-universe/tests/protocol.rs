@@ -109,6 +109,7 @@ fn out_of_order_and_late_within_window_accepted() {
     let cfg = SessionConfig {
         gap_window: Duration::from_secs(5),
         session_timeout: Duration::from_secs(50),
+        max_gap_span: 65_536,
     };
     let mut tx = Sender::new(&seed);
     let mut rx = Receiver::new(&seed, cfg);
@@ -130,6 +131,7 @@ fn gap_window_timeout_voids_coord() {
     let cfg = SessionConfig {
         gap_window: Duration::from_millis(120),
         session_timeout: Duration::from_secs(50),
+        max_gap_span: 65_536,
     };
     let mut tx = Sender::new(&seed);
     let mut rx = Receiver::new(&seed, cfg);
@@ -153,6 +155,7 @@ fn session_silent_timeout_expires() {
     let cfg = SessionConfig {
         gap_window: Duration::from_secs(30),
         session_timeout: Duration::from_millis(120),
+        max_gap_span: 65_536,
     };
     let mut tx = Sender::new(&seed);
     let mut rx = Receiver::new(&seed, cfg);

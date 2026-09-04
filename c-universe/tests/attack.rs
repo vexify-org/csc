@@ -27,6 +27,7 @@ fn attack_bypass_permanent_void_via_retain_prune() {
     let cfg = SessionConfig {
         gap_window: Duration::from_millis(120),
         session_timeout: Duration::from_secs(50),
+        max_gap_span: 65_536,
     };
     let mut rx = Receiver::new(&root, cfg);
 
@@ -89,4 +90,38 @@ fn attack_confirm_blocked_surface() {
 
     // 原样重放 → 已被核销，拒绝。
     assert_eq!(rx.recv(&legit).unwrap_err(), ReceiveError::Replay(0));
+}
+
+/// 攻击 ③ —— coord 巨跳 DoS（加固验证）。
+///
+/// 可信发送端若被攻陷/故障，可能把 coord 从低位直接跳到 2^48 级。
+/// 加固后：单次调用不应枚举/分配千万级元素，远端空缺区被整体作废；
+/// 同时不破坏正常小跨度的 30s 窗口。
+#[test]
+fn hardened_mega_coord_jump_is_bounded() {
+    let root = random_bytes_32();
+    let cfg = SessionConfig {
+        gap_window: Duration::from_secs(30),
+        session_timeout: Duration::from_secs(50),
+        // 刻意调小，便于在测试里触发并观察巨跳分支。
+        max_gap_span: 8,
+    };
+    let mut rx = Receiver::new(&root, cfg);
+
+    // 建立基线：coord 0。
+    assert!(rx.recv(&Packet::new(&root, 0, b"base")).is_ok());
+
+    // 触发一次异常巨跳：0 → 1_000_000。不应卡死 / OOM。
+    let t = std::time::Instant::now();
+    assert!(rx.recv(&Packet::new(&root, 1_000_000, b"mega")).is_ok());
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "巨跳处理超时，疑似被逐 coord 枚举拖垮"
+    );
+
+    // 位于被整体作废区间的 coord（500_000，未核销）必须被永久拒绝。
+    assert_eq!(
+        rx.recv(&Packet::new(&root, 500_000, b"far")).unwrap_err(),
+        ReceiveError::Voided(500_000)
+    );
 }

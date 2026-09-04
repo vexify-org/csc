@@ -18,6 +18,12 @@ pub struct SessionConfig {
     pub gap_window: Duration,
     /// 全局会话静默熔断阈值。
     pub session_timeout: Duration,
+    /// 单次向前跳号允许追踪的空缺数量上限（加固项）。
+    ///
+    /// 超过该跨度视为异常巨跳：远端空缺区整体置为永久作废（不逐 coord 枚举），
+    /// 仅对靠近到达包的有限尾部开窗，从而把单包触发的 CPU/内存开销限制在常数级，
+    /// 防止可信发送端 coord 异常跳变导致的拒绝服务。
+    pub max_gap_span: u64,
 }
 
 impl Default for SessionConfig {
@@ -25,6 +31,7 @@ impl Default for SessionConfig {
         SessionConfig {
             gap_window: Duration::from_secs(30),
             session_timeout: Duration::from_secs(50),
+            max_gap_span: 65_536,
         }
     }
 }
@@ -59,6 +66,9 @@ pub struct Receiver {
     pending: HashMap<u64, Instant>,
     /// 空缺窗口已超时、被永久作废的 coord（墓碑，防 retain 清理后复活）。
     voided: HashSet<u64>,
+    /// 异常巨跳的整体作废前缀：所有 `c < voided_prefix` 且未核销的 coord 一律作废。
+    /// 用于 O(1) 巩固数千万元素的大跨度区间，避免逐 coord 枚举。
+    voided_prefix: u64,
     /// 已连续收到的最大 coord（无缺口的边界）。
     last_contiguous: i128,
     /// 最近一次成功解密业务包的时刻（50s 熔断计时基准）。
@@ -74,6 +84,7 @@ impl Receiver {
             used: HashSet::new(),
             pending: HashMap::new(),
             voided: HashSet::new(),
+            voided_prefix: 0,
             last_contiguous: -1,
             last_received: None,
         }
@@ -126,8 +137,9 @@ impl Receiver {
             return Err(ReceiveError::Replay(coord));
         }
 
-        // 墓碑：曾开窗口、已超时作废的 coord，永久拒绝（即使已从 pending 清理）。
-        if self.voided.contains(&coord) {
+        // 墓碑：曾开窗口已超时作废的 coord，或异常巨跳整体作废前缀内的 coord，
+        //  永久拒绝（即使已从 pending 清理）。
+        if self.voided.contains(&coord) || coord < self.voided_prefix {
             return Err(ReceiveError::Voided(coord));
         }
 
@@ -156,13 +168,7 @@ impl Receiver {
             self.last_contiguous = coord as i128;
             self.advance_contiguous();
         } else if coord as i128 > self.last_contiguous + 1 {
-            // 跳号：为中间所有缺失 coord 开启 30s 宽容窗口。
-            for missing in (self.last_contiguous + 1)..(coord as i128) {
-                let m = missing as u64;
-                if !self.used.contains(&m) {
-                    self.pending.entry(m).or_insert(now + self.cfg.gap_window);
-                }
-            }
+            self.open_gap_window(coord, now);
         }
 
         // 清理已到的 pending 条目。
@@ -171,6 +177,34 @@ impl Receiver {
         self.evict_expired(now);
 
         Ok(plaintext)
+    }
+
+    /// 为跳号产生的空缺坐标开启 30s 宽容窗口。
+    ///
+    /// 若单次向前跨度超过 `max_gap_span`，视为异常巨跳：
+    /// - 远端空缺区通过 `voided_prefix` **整体永久作废**（O(1)，不逐 coord 枚举）；
+    /// - 仅对靠近到达包的有限尾部开窗。
+    /// 由此保证单包触发的 CPU/内存开销为常数级，杜绝 coord 巨跳导致的拒绝服务。
+    fn open_gap_window(&mut self, coord: u64, now: Instant) {
+        let cont_plus1 = self.last_contiguous + 1; // i128
+        let cap = self.cfg.max_gap_span.max(1) as i128;
+        let gap_len = coord as i128 - cont_plus1;
+
+        let start = if gap_len > cap { coord as i128 - cap } else { cont_plus1 };
+
+        if gap_len > cap {
+            // 异常巨跳：把 [cont_plus1, coord-cap) 整体作废。
+            let far_end = start;
+            self.voided_prefix = self.voided_prefix.max(far_end as u64);
+        }
+
+        // 仅对 [start, coord) 开窗（正常跳号即 [last_contiguous+1, coord)）。
+        for missing in start..(coord as i128) {
+            let m = missing as u64;
+            if !self.used.contains(&m) {
+                self.pending.entry(m).or_insert(now + self.cfg.gap_window);
+            }
+        }
     }
 
     /// 把已过期的空缺窗口移入墓碑（永久作废），并按连续边界收缩老旧数据。
