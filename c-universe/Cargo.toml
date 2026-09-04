@@ -1,0 +1,19 @@
+[package]
+name = "c-universe"
+version = "1.2.0"
+edition = "2021"
+description = "C-Universe chaotic streaming transport protocol (V1.2) reference implementation"
+license = "MIT"
+
+[dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+thiserror = "1"
+
+[dev-dependencies]
+
+[[example]]
+name = "chaos_demo"
