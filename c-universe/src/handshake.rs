@@ -108,40 +108,10 @@ impl DhKeyPair {
     }
 
     /// 暴露原始 X25519 共享密钥（用于审计验证；正常流程请走
-    /// [`DhKeyPair::derive_session_root_with_salt`] 的校验路径）。
+    /// [`DhKeyPair::derive_directional_roots_with_salt`] 的校验路径）。
     pub fn dh_shared_secret(&self, peer_public: &[u8; 32]) -> [u8; 32] {
         let peer = x25519_dalek::PublicKey::from(*peer_public);
         self.secret.diffie_hellman(&peer).to_bytes()
-    }
-
-    /// 以对方公钥 + 双方拼接的会话盐派生会话根种子 `S₀`。
-    ///
-    /// 执行 RFC 7748 规定的最低限校验：拒绝产生全零共享密钥的低阶点公钥，
-    /// 避免握手被注入弱密钥。仅在 QUIC-TLS 校验完成、确认对方是可信对端后方可调用。
-    ///
-    /// # 废弃（漏洞 F：旧 API 未废弃 → 降级 / 跨方向重放）
-    ///
-    /// 单一根种子 `S₀` 在双向通信下会让两个方向在相同 coord 产生**完全一致**的
-    /// 单包密钥，攻击者可跨方向解密与重放。请改用 [`DhKeyPair::derive_directional_roots_with_salt`]
-    /// 派生互不相同的方向根；本方法仅保留以兼容旧集成，**已废弃**，正被移除。
-    #[deprecated(
-        since = "1.2.0",
-        note = "single-root S0 is insecure for bidirectional links (cross-direction replay); use derive_directional_roots_with_salt instead. This is a downgrade vector and is scheduled for removal."
-    )]
-    // 本方法自身已废弃，内部再经同样废弃的版本来实现是预期的兼容垫片。
-    #[allow(deprecated)]
-    pub fn derive_session_root_with_salt(
-        &self,
-        peer_public: &[u8; 32],
-        session_salt: &[u8],
-    ) -> Result<[u8; KEY_LEN], HandshakeError> {
-        let peer = x25519_dalek::PublicKey::from(*peer_public);
-        let dh = self.secret.diffie_hellman(&peer);
-        let raw: [u8; 32] = dh.to_bytes();
-        if is_all_zero(&raw) {
-            return Err(HandshakeError::WeakDhSecret);
-        }
-        Ok(crypto::derive_session_root(&raw, session_salt))
     }
 
     /// 以对方公钥 + 双方拼接的会话盐派生**方向化会话根种子对**

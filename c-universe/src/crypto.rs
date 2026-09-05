@@ -14,8 +14,6 @@ use sha2::Sha256;
 
 use crate::KEY_LEN;
 
-/// 会话根种子派生的域分离标签（把本协议密钥空间与其他用途隔离）。
-pub const SESSION_ROOT_INFO: &[u8] = b"C-Universe-Session-Root-v1.2";
 /// 单包密钥派生的域分离标签。
 pub const PACKET_KEY_INFO: &[u8] = b"C-Universe-PacketKey-v1.2";
 
@@ -43,27 +41,6 @@ pub fn combine_session_salts(a: &[u8; 32], b: &[u8; 32]) -> [u8; 64] {
 /// 将 coord 编码为固定大端 8 字节（作为单包派生的盐）。
 pub fn coord_to_be_bytes(coord: u64) -> [u8; 8] {
     coord.to_be_bytes()
-}
-
-/// 会话根种子派生：
-/// `S₀ = HKDF-SHA256(IKM=raw-DH-secret, salt=session_salt, info=SESSION_ROOT_INFO, L=32)`。
-///
-/// # 废弃（漏洞 F：旧 API 未废弃 → 降级 / 跨方向重放）
-///
-/// 单一根种子 `S₀` 在双向通信下会让两个方向在相同 coord 派生出**完全一致**的
-/// 单包密钥，攻击者可跨方向解密与重放。请改用 [`derive_directional_roots`]，其为
-/// 双向派生互不相同的会话根；本函数仅保留以兼容旧集成，**已废弃**，正被移除。
-#[deprecated(
-    since = "1.2.0",
-    note = "single-root S0 is insecure for bidirectional links (cross-direction replay); use derive_directional_roots instead. Downgrade vector, scheduled for removal."
-)]
-pub fn derive_session_root(dh_secret: &[u8; 32], session_salt: &[u8]) -> [u8; KEY_LEN] {
-    let hk = Hkdf::<Sha256>::new(Some(session_salt), dh_secret);
-    let mut out = [0u8; KEY_LEN];
-    // HKDF 输出长度 32 恒不越界。
-    hk.expand(SESSION_ROOT_INFO, &mut out)
-        .expect("32 bytes always fits HKDF-SHA256");
-    out
 }
 
 /// 方向化会话根种子派生（双向隔离）：
