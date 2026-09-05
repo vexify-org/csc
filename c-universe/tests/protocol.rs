@@ -7,9 +7,9 @@ use c_universe::handshake::DhKeyPair;
 use c_universe::packet::Packet;
 use c_universe::{ReceiveError, Receiver, SessionConfig, Sender};
 
-/// 握手两端能够得到一致的会话根种子。
+/// 握手两端能够得到**一致的方向化会话根种子对**（双向隔离）。
 #[test]
-fn handshake_reaches_common_root() {
+fn handshake_reaches_common_directional_roots() {
     // 双方各自生成 DH 密钥对与会话盐，并各自发出握手帧。
     let (ka, salt_a) = {
         let kp = DhKeyPair::generate();
@@ -32,11 +32,21 @@ fn handshake_reaches_common_root() {
     let combined_a = crypto::combine_session_salts(&salt_a, &salt_b);
     let combined_b = crypto::combine_session_salts(&salt_a, &salt_b);
 
-    let root_a = ka.derive_session_root_with_salt(&pub_b, &combined_a).unwrap();
-    let root_b = kb.derive_session_root_with_salt(&pub_a, &combined_b).unwrap();
+    let (ir_a, ri_a) = ka
+        .derive_directional_roots_with_salt(&pub_b, &combined_a)
+        .unwrap();
+    let (ir_b, ri_b) = kb
+        .derive_directional_roots_with_salt(&pub_a, &combined_b)
+        .unwrap();
 
-    assert_eq!(root_a, root_b);
-    assert_ne!(root_a, [0u8; 32]);
+    // 同一方向两端鉴出同一根。
+    assert_eq!(ir_a, ir_b);
+    assert_eq!(ri_a, ri_b);
+    // 两方向互不相同（双向隔离）。
+    assert_ne!(ir_a, ri_a);
+    // 均为非零。
+    assert_ne!(ir_a, [0u8; 32]);
+    assert_ne!(ri_a, [0u8; 32]);
 }
 
 /// 上行收发一一对应（正常流）。

@@ -25,6 +25,11 @@ pub enum HandshakeError {
     /// X25519 派生出全零共享密钥（对端公钥为低阶点），握手被强制拒绝。
     #[error("weak/zero DH shared secret (low-order peer public key)")]
     WeakDhSecret,
+    /// 底层可靠通道（QUIC）读写失败。
+    ///
+    /// 返回错误而非 panic，避免攻击者以 RST/断开流的方式让握手进程崩溃。
+    #[error("transport error during handshake")]
+    Transport,
 }
 
 /// 一方在一次握手中的地位。
@@ -95,6 +100,26 @@ impl DhKeyPair {
         }
         Ok(crypto::derive_session_root(&raw, session_salt))
     }
+
+    /// 以对方公钥 + 双方拼接的会话盐派生**方向化会话根种子对**
+    /// `(root_initiator_to_responder, root_responder_to_initiator)`。
+    ///
+    /// 除执行 RFC 7748 低阶点校验外，本方法同时产出两个互不相同的方向根，
+    /// 使双向链路密钥空间隔离 —— 复用单一根种子会让双向密钥在相同 coord 下完全一致，
+    /// 攻击者可跨方向解密或重放。返回的对请按 [`Role`] 分配给两端各自的 Sender/Receiver。
+    pub fn derive_directional_roots_with_salt(
+        &self,
+        peer_public: &[u8; 32],
+        session_salt: &[u8],
+    ) -> Result<([u8; KEY_LEN], [u8; KEY_LEN]), HandshakeError> {
+        let peer = x25519_dalek::PublicKey::from(*peer_public);
+        let dh = self.secret.diffie_hellman(&peer);
+        let raw: [u8; 32] = dh.to_bytes();
+        if is_all_zero(&raw) {
+            return Err(HandshakeError::WeakDhSecret);
+        }
+        Ok(crypto::derive_directional_roots(&raw, session_salt))
+    }
 }
 
 /// 解析一帧对端握手数据。
@@ -134,33 +159,56 @@ pub trait Transport {
     fn reliable_read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error>;
 }
 
+/// 一次完整 DH 磋商的产物。
+///
+/// `Debug` 实现通过 `DhKeyPair` 的自定义安全 Debug，绝不打印私钥与共享密钥。
+#[derive(Debug)]
+pub struct HandshakeSession {
+    /// 本地 DH 密钥对（公钥用于后续审计验证）。
+    pub keypair: DhKeyPair,
+    /// 本次磋商中己方扮演的角色。
+    pub role: Role,
+    /// Initiator→Responder 方向会话根种子。
+    ///
+    /// 分配给 **Initiator 的发送端** 与 **Responder 的接收端**。
+    pub root_initiator_to_responder: [u8; KEY_LEN],
+    /// Responder→Initiator 方向会话根种子。
+    ///
+    /// 分配给 **Responder 的发送端** 与 **Initiator 的接收端**。
+    pub root_responder_to_initiator: [u8; KEY_LEN],
+    /// 本地产生的会话盐。
+    pub session_salt: [u8; 32],
+}
+
 /// 在任意满足 [`Transport`] 的可信通道上完成一次完整 DH 磋商（单端视角）。
 ///
 /// 流程（双方各执行一次 `negotiate`）：
 /// 1. 生成 DH 密钥对与会话盐；
 /// 2. 可靠发送 `public_key || salt`；
 /// 3. 可靠读取对方 `peer_public_key || peer_salt`；
-/// 4. 按角色拼接双方盐，派生会话根种子 `S₀`。
+/// 4. 按角色拼接双方盐，派生方向化会话根种子对。
 ///
 /// > 调用前必须在 QUIC-TLS 层完成对端身份校验；身份未通过的连接不得进入本流程。
+///
+/// # 安全
+///
+/// 底层可靠通道的读写错误以 [`HandshakeError::Transport`] 返回，**绝不 panic**：
+/// 攻击者通过 RST 或断开流中止握手时，只会得到一个可处理的错误，不会击穿进程。
 pub fn negotiate<T: Transport>(
     role: Role,
     transport: &mut T,
-) -> Result<(DhKeyPair, [u8; KEY_LEN], [u8; 32]), HandshakeError>
-where
-    T::Error: std::fmt::Debug,
-{
+) -> Result<HandshakeSession, HandshakeError> {
     let kp = DhKeyPair::generate();
     let salt = random_bytes_32();
     let outbound = kp.outbound_frame(&salt);
 
     transport
         .reliable_write(&outbound)
-        .expect("QUIC stream write failure");
+        .map_err(|_| HandshakeError::Transport)?;
     let mut frame = [0u8; 64];
     transport
         .reliable_read_exact(&mut frame)
-        .expect("QUIC stream read failure");
+        .map_err(|_| HandshakeError::Transport)?;
     let (peer_pub, peer_salt) = parse_peer_frame(&frame)?;
 
     // 双方盐拼接；角色顺序固定为 A||B 以保证两端一致。
@@ -168,8 +216,15 @@ where
         Role::Initiator => crypto::combine_session_salts(&salt, &peer_salt),
         Role::Responder => crypto::combine_session_salts(&peer_salt, &salt),
     };
-    let root = kp.derive_session_root_with_salt(&peer_pub, &combined)?;
-    Ok((kp, root, salt))
+    let (root_initiator_to_responder, root_responder_to_initiator) =
+        kp.derive_directional_roots_with_salt(&peer_pub, &combined)?;
+    Ok(HandshakeSession {
+        keypair: kp,
+        role,
+        root_initiator_to_responder,
+        root_responder_to_initiator,
+        session_salt: salt,
+    })
 }
 
 /// 便捷：验证给定公钥是否在受信任指纹集合中（自签证书指纹比对场景）。

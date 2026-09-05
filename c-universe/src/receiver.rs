@@ -71,6 +71,8 @@ pub struct Receiver {
     voided_prefix: u64,
     /// 已连续收到的最大 coord（无缺口的边界）。
     last_contiguous: i128,
+    /// 会话建立（本接收端创建）时刻 —— 首包到达前的静默熔断计时基准。
+    started: Instant,
     /// 最近一次成功解密业务包的时刻（50s 熔断计时基准）。
     last_received: Option<Instant>,
 }
@@ -86,6 +88,7 @@ impl Receiver {
             voided: HashSet::new(),
             voided_prefix: 0,
             last_contiguous: -1,
+            started: Self::now(),
             last_received: None,
         }
     }
@@ -108,29 +111,46 @@ impl Receiver {
 
     /// 检测全局会话静默熔断。返回 `Err(SessionExpired)` 时，调用方应销毁本会话、
     /// 丢弃全部密钥并重新握手。
+    ///
+    /// 计时基准为「最近成功解密业务包」；若首包从未到达，则退化为会话建立时刻，
+    /// 保证握手后长期空闲的会话密钥同样会在 `session_timeout` 后失效。
     pub fn check_session_alive(&self) -> Result<(), ReceiveError> {
-        if let Some(lr) = self.last_received {
-            if Self::now().duration_since(lr) > self.cfg.session_timeout {
-                return Err(ReceiveError::SessionExpired);
-            }
+        let anchor = self.last_received.unwrap_or(self.started);
+        if Self::now().duration_since(anchor) > self.cfg.session_timeout {
+            return Err(ReceiveError::SessionExpired);
         }
         Ok(())
     }
 
     /// 处理一个收到的报文。任何防御层拦截返回对应错误，调用方可据此打点/丢弃。
+    ///
+    /// # 顺序（抗侧信道）
+    ///
+    /// 1. 结构性解析 → `Malformed`；
+    /// 2. **先做 AEAD 认证**：无法解密的报文一律返回 `AuthenticationFailed`；
+    /// 3. 认证通过后才协商内部状态（会话过期 / 重放 / 作废）。
+    ///
+    /// 由此，未持有会话密钥的攻击者（伪造 / 随机报文）只能得到统一的
+    /// `AuthenticationFailed`，无法通过错误类型差异区分 coord 是否已被使用、
+    /// 是否被作废、会话是否已经过期 —— 这些状态只对能成功解密的合法对端可见。
     pub fn recv(&mut self, packet: &Packet) -> Result<Vec<u8>, ReceiveError> {
         let now = Self::now();
 
-        // 第三层：50s 静默熔断。
-        if let Some(lr) = self.last_received {
-            if now.duration_since(lr) > self.cfg.session_timeout {
-                return Err(ReceiveError::SessionExpired);
-            }
-        }
-
-        // 解析头部。
+        // 第一步：结构性解析（不依赖会话状态，不构成侧信道）。
         let header = packet.header().map_err(|_| ReceiveError::Malformed)?;
         let coord = header.coord;
+
+        // 第二步：先密码学认证 —— 伪造/篡改/错钥在这里被统一拦截，
+        //  绝不因网关前置检查把内部状态泄露给无密钥的攻击者。
+        let plaintext = packet
+            .decrypt(&self.seed)
+            .map_err(|_| ReceiveError::AuthenticationFailed)?;
+
+        // 第三层：50s 静默熔断（首包前退化为会话建立时刻起算）。
+        let anchor = self.last_received.unwrap_or(self.started);
+        if now.duration_since(anchor) > self.cfg.session_timeout {
+            return Err(ReceiveError::SessionExpired);
+        }
 
         // 第一层：核销表，同 coord 终身拒绝重放。
         if self.used.contains(&coord) {
@@ -152,12 +172,7 @@ impl Receiver {
             }
         }
 
-        // 密码学：AEAD 解密 + 完整性校验。任何伪造/篡改在此被拦截。
-        let plaintext = packet
-            .decrypt(&self.seed)
-            .map_err(|_| ReceiveError::AuthenticationFailed)?;
-
-        // —— 至此包合法，进入核销与窗口维护 ——
+        // —— 至此包通过认证且状态有效，进入核销与窗口维护 ——
 
         // 第一层落核销表。
         self.used.insert(coord);
@@ -220,9 +235,15 @@ impl Receiver {
             self.pending.remove(&c);
         }
         // coord <= last_contiguous 的必已被 `used` 收纳，墓碑/pending 从此刻可释放。
-        let bound = self.last_contiguous;
-        self.voided.retain(|&c| c > bound as u64);
-        self.pending.retain(|&c, _| c > bound as u64);
+        // 仅在已建立连续前缀（>=0）时才收紧边界：首包若为 coord>0，`last_contiguous`
+        // 仍为 -1，此时 `(-1 as u64)` 是 u64::MAX，若直接 retain `c > bound` 会把
+        // 空缺窗口与墓碑全部清空且**不落作废**，导致低序号 coord 永不作废、可无限重放。
+        // 故在此类情形下禁止收紧，让空缺窗口存活到期并由上方分批转入 `voided`。
+        if self.last_contiguous >= 0 {
+            let bound = self.last_contiguous as u64;
+            self.voided.retain(|&c| c > bound);
+            self.pending.retain(|&c, _| c > bound);
+        }
     }
 }
 

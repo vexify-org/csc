@@ -18,6 +18,16 @@ use crate::KEY_LEN;
 pub const SESSION_ROOT_INFO: &[u8] = b"C-Universe-Session-Root-v1.2";
 /// 单包密钥派生的域分离标签。
 pub const PACKET_KEY_INFO: &[u8] = b"C-Universe-PacketKey-v1.2";
+
+/// 双向隔离：Initiator→Responder 方向的域分离标签。
+///
+/// 复用单一会话根种子 `S₀` + 同一 coord 会让双向密钥完全相同，
+/// 攻击者可跨方向解密/重放。方向化根种子从共同 DH 派生，保证两方向密钥空间互斥。
+pub const DIR_ROOT_INITIATOR_TO_RESPONDER: &[u8] =
+    b"C-Universe-DirRoot-Initiator-To-Responder-v1.2";
+/// 双向隔离：Responder→Initiator 方向的域分离标签。
+pub const DIR_ROOT_RESPONDER_TO_INITIATOR: &[u8] =
+    b"C-Universe-DirRoot-Responder-To-Initiator-v1.2";
 /// AEAD nonce 长度（ChaCha20-Poly1305 标准 12 字节）。
 pub const NONCE_LEN: usize = 12;
 
@@ -44,6 +54,25 @@ pub fn derive_session_root(dh_secret: &[u8; 32], session_salt: &[u8]) -> [u8; KE
     hk.expand(SESSION_ROOT_INFO, &mut out)
         .expect("32 bytes always fits HKDF-SHA256");
     out
+}
+
+/// 方向化会话根种子派生（双向隔离）：
+/// 从共同 DH 秘密一次性派生 `(Initiator→Responder, Responder→Initiator)` 两个根。
+///
+/// 两个方向各自独立、互不相同，交由两端按角色分配到各自的 Sender/Receiver。
+/// 由此即使两端复用同一 coord 序号空间，密钥也互不相同，杜绝跨方向解密/重放。
+pub fn derive_directional_roots(
+    dh_secret: &[u8; 32],
+    session_salt: &[u8],
+) -> ([u8; KEY_LEN], [u8; KEY_LEN]) {
+    let hk = Hkdf::<Sha256>::new(Some(session_salt), dh_secret);
+    let mut ir = [0u8; KEY_LEN];
+    let mut ri = [0u8; KEY_LEN];
+    hk.expand(DIR_ROOT_INITIATOR_TO_RESPONDER, &mut ir)
+        .expect("32 bytes always fits HKDF-SHA256");
+    hk.expand(DIR_ROOT_RESPONDER_TO_INITIATOR, &mut ri)
+        .expect("32 bytes always fits HKDF-SHA256");
+    (ir, ri)
 }
 
 /// 单包密钥派生：
