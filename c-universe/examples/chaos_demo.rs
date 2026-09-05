@@ -102,8 +102,8 @@ fn main() {
         match rx.recv(&victim) {
             Ok(_plain) => {
                 accepted += 1;
-                if let Ok(h) = victim.header() {
-                    received.insert(h.coord);
+                if let Some(c) = victim.recover_coord(&root) {
+                    received.insert(c);
                 }
             }
             Err(ReceiveError::Replay(_)) => replayed += 1,

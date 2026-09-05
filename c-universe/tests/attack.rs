@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use c_universe::crypto;
 use c_universe::handshake::{random_bytes_32, HandshakeError};
 use c_universe::packet::Packet;
 use c_universe::{ReceiveError, Receiver, SessionConfig};
@@ -507,4 +508,102 @@ fn attack_unknown_identity_key_is_rejected() {
     tampered[AUTH_OFFSET] ^= 0x01;
     let err = parse_handshake_frame(&tampered, &key_ab, Role::Initiator).unwrap_err();
     assert_eq!(err, HandshakeError::AuthenticationFailed);
+}
+
+/// 攻击 ⑭ —— 前向保密（KeyUpdate）：泄露当前密钥不回溯历史。
+///
+/// 发送方 `key_update()` 用单向 HKDF 棘轮前滚并**弃用旧根**。若实现无法前向保密，
+/// 持有「当前时代」根种子的攻击者应能解密早期时代的历史报文。
+/// 断言：只持当前根 R2 的接收端无法解密用 R0 加密的历史包（HKDF 单向，旧根不可回溯）。
+#[test]
+fn attack_forward_secrecy_old_traffic_not_recoverable_from_current_key() {
+    use c_universe::Sender;
+    let root = random_bytes_32();
+    let mut tx = Sender::new(&root);
+
+    // 时代 0 的历史包（R0 加密）。
+    let hist_pkt = tx.send(b"historical-secret");
+    // 前滚到时代 1、再前滚到时代 2 → 旧根 R0/R1 被弃用。
+    tx.key_update();
+    let era1_pkt = tx.send(b"era-1");
+    tx.key_update();
+    // 攻击者此刻只窃取了"当前"根 R2 = ratchet(ratchet(R0,1),2)。
+    let current_root = crypto::ratchet(&crypto::ratchet(&root, 1), 2);
+    let mut attacker_rx = Receiver::new(&current_root, SessionConfig::default());
+
+    // 只持 R2 无法解密 R0 加密的历史包（前向保密）。
+    let err = attacker_rx.recv(&hist_pkt).unwrap_err();
+    assert_eq!(
+        err,
+        ReceiveError::AuthenticationFailed,
+        "前向保密失效：仅持当前根种子即可解密历史时代报文"
+    );
+
+    // 对照：合法接收端从 R0 出发，逐代 ratchet 前瞻，各时代包都能解密（密钥链未断）。
+    let mut honest_rx = Receiver::with_defaults(&root);
+    assert_eq!(honest_rx.recv(&hist_pkt).unwrap(), b"historical-secret");
+    assert_eq!(honest_rx.recv(&era1_pkt).unwrap(), b"era-1");
+    let era2_pkt = tx.send(b"era-2-fresh");
+    assert_eq!(honest_rx.recv(&era2_pkt).unwrap(), b"era-2-fresh");
+}
+
+/// 攻击 ⑮ —— KeyUpdate 前滚一致性：接收端自动识别下一时代并解密，确认后旧钥被弃。
+///
+/// 跨 KeyUpdate 边界的乱序旧包（旧时代密钥加密、超前调用）必须被拒绝 ——
+/// 一旦接收端确认 `key_update` 便弃用旧根（与 QUIC 一致）。
+#[test]
+fn attack_key_update_roundtrip_and_old_key_dropped() {
+    use c_universe::Sender;
+    let root = random_bytes_32();
+    let mut tx = Sender::new(&root);
+    let mut rx = Receiver::with_defaults(&root);
+
+    // 时代 0 正常收发。
+    let p0 = tx.send(b"pre-update");
+    assert_eq!(rx.recv(&p0).unwrap(), b"pre-update");
+
+    // 主动 key_update → 时代 1；新包被接收端自动识别（ratchet 前瞻命中）。
+    tx.key_update();
+    let p1 = tx.send(b"post-update");
+    assert_eq!(rx.recv(&p1).unwrap(), b"post-update");
+    assert_eq!(tx.era(), 1);
+
+    // 跨边界旧时代包（era0 加密、此前未投递）→ 旧钥已弃用 → 认证失败。
+    let late_old = Packet::new(&root, 999, b"late-old-era");
+    assert_eq!(
+        rx.recv(&late_old).unwrap_err(),
+        ReceiveError::AuthenticationFailed,
+        "前滚后旧时代密钥未被弃用（前向保密缺失）"
+    );
+
+    // 新时代的正常包继续可解（密钥链未断）。
+    let p1b = tx.send(b"post-update-2");
+    assert_eq!(rx.recv(&p1b).unwrap(), b"post-update-2");
+}
+
+/// 攻击 ⑯ —— 头部保护：coord 不以明文出现在线上字节。
+///
+/// 若 coord 明文暴露，观察者即可获得流量序号，做流量分析/相关性攻击。
+/// 断言：线上字节中的 coord 区段 ≠ 真实 coord 大端；未持密钥的观察者读不到真实 coord，
+/// 只有持有方向根种子（派 HP 密钥）才能恢复。
+#[test]
+fn attack_header_protection_hides_coord() {
+    use c_universe::Sender;
+    let root = random_bytes_32();
+    let mut tx = Sender::new(&root);
+    let pkt = tx.send(b"some-observable-payload-data"); // coord = 0
+
+    let raw = pkt.as_bytes();
+    // ① 版本仍明文（协议标识，供路由）。
+    assert_eq!(raw[0], c_universe::PROTOCOL_VERSION);
+    // ② coord=0 的真实大端是 [0;8]；线上字节不得与之相同（被 HP 掩码掩盖）。
+    let real = 0u64.to_be_bytes();
+    assert_ne!(&raw[1..9], &real, "coord 以明文出现在线上字节，违反头部保护");
+    // ③ 从网络字节重构（观察者视角）读出的 coord ≠ 真实 coord。
+    let net = Packet::from_bytes(raw.to_vec());
+    assert_ne!(net.header().unwrap().coord, 0, "观察者可读出明文 coord");
+    // ④ 持根种子者可恢复真实 coord（唯一合法读取方式）。
+    assert_eq!(net.recover_coord(&root), Some(0));
+    // ⑤ 持错误根种子的观察者无法恢复（乱猜必错）。
+    assert_ne!(net.recover_coord(&[0xAA; 32]), Some(0));
 }

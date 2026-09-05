@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::packet::Packet;
+use crate::crypto;
+use crate::crypto::HP_SAMPLE_LEN;
+use crate::packet::{Packet, HEADER_LEN};
 use crate::KEY_LEN;
 
 /// 会话级可调参数。
@@ -96,6 +98,11 @@ pub struct Receiver {
     auth_failures: u64,
     /// 认证洪水熔断（漏洞 G）：shed 持续到该时刻为止，期间 O(1) 拒绝不做 AEAD。
     shed_until: Option<Instant>,
+    /// 当前 KeyUpdate 时代序号（0 起）；`seed` 即该时代根种子。
+    ///
+    /// KeyUpdate 时接收端先以**前瞻一个时代**（ratchet 后）尝试解密，命中后前滚并
+    /// **弃用旧根** —— 旧时代密钥不再保留，提供前向保密。
+    recv_era: u64,
 }
 
 impl Receiver {
@@ -113,6 +120,7 @@ impl Receiver {
             last_received: None,
             auth_failures: 0,
             shed_until: None,
+            recv_era: 0,
         }
     }
 
@@ -123,6 +131,32 @@ impl Receiver {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    /// 头部保护 + 时代的密码学认证尝试（KeyUpdate 感知）。
+    ///
+    /// 先以**当前时代**根种子尝试：`Packet::attempt_decrypt` 内含 HP 解掩 + AEAD 校验，
+    /// 失败者大概率是握手方已 `key_update` 进入下一代 —— 再以 **ratchet 前瞻一个时代**
+    /// 重试。仅命中「当前时代 + 1」时返回该时代，由 `recv` 据此前滚并弃用旧根。
+    ///
+    /// 返回 `(实际命中时代, 真实coord, 明文)`。两种时代都失败 → `None`（伪造/篡改/错钥）。
+    fn try_auth(&self, packet: &Packet) -> Option<(u64, u64, Vec<u8>)> {
+        if let Some((coord, plain)) = packet.attempt_decrypt(&self.seed, self.recv_era) {
+            return Some((self.recv_era, coord, plain));
+        }
+        let next_era = self.recv_era.wrapping_add(1);
+        let next_root = crypto::ratchet(&self.seed, next_era);
+        if let Some((coord, plain)) = packet.attempt_decrypt(&next_root, next_era) {
+            return Some((next_era, coord, plain));
+        }
+        None
+    }
+
+    /// KeyUpdate 前滚：接受新一时代根，永久弃用旧根（前向保密）。
+    fn ratchet_forward(&mut self, new_era: u64) {
+        debug_assert_eq!(new_era, self.recv_era.wrapping_add(1));
+        self.seed = crypto::ratchet(&self.seed, new_era);
+        self.recv_era = new_era;
     }
 
     /// 推进连续边界：只要下一个 coord 已核销则推进。
@@ -181,19 +215,20 @@ impl Receiver {
         }
 
         // 第一步：结构性解析（不依赖会话状态，不构成侧信道）。
-        let header = packet.header().map_err(|_| ReceiveError::Malformed)?;
-        let coord = header.coord;
+        // 头部保护后 coord 已掩码，这里仅校验「足够容纳密文样本」的最小长度。
+        if packet.as_bytes().len() < HEADER_LEN + HP_SAMPLE_LEN {
+            return Err(ReceiveError::Malformed);
+        }
 
-        // 第二步：先密码学认证 —— 伪造/篡改/错钥在这里被统一拦截，
-        //  绝不因网关前置检查把内部状态泄露给无密钥的攻击者。
-        //  任一合法包即复位连续失败计数（自愈）：唯有连续 1024 次认证失败
-        //  才会触发 `DoSLimit` 全局 shed。
-        let plaintext = match packet.decrypt(&self.seed) {
-            Ok(p) => {
+        // 第二步：先密码学认证（头部保护解掩 + KeyUpdate 时代枚举 + AEAD）——
+        //  伪造/篡改/错钥在这里被统一拦截，绝不因网关前置检查把内部状态泄露给无密钥攻击者。
+        //  任一合法包即复位连续失败计数（自愈）：唯有连续 1024 次认证失败才触发 DoSLimit。
+        let (era_used, coord, plaintext) = match self.try_auth(packet) {
+            Some(x) => {
                 self.auth_failures = 0;
-                p
+                x
             }
-            Err(_) => {
+            None => {
                 self.auth_failures += 1;
                 if self.auth_failures >= AUTH_FAILURE_SHED_THRESHOLD {
                     self.shed_until = Some(now + AUTH_SHED_WINDOW);
@@ -202,6 +237,12 @@ impl Receiver {
                 return Err(ReceiveError::AuthenticationFailed);
             }
         };
+
+        // KeyUpdate 确认：命中"当前时代 + 1" → 前滚到新一代并**弃用旧根**。
+        // 一旦前滚，旧时代密钥即被遗忘，后续到达的旧时代包无从解密（前向保密 + 乱序代价）。
+        if era_used == self.recv_era.wrapping_add(1) {
+            self.ratchet_forward(era_used);
+        }
 
         // 第三层：50s 静默熔断（首包前退化为会话建立时刻起算）。
         let anchor = self.last_received.unwrap_or(self.started);
