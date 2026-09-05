@@ -176,7 +176,9 @@ fn attack_low_order_point_injection_rejected() {
 /// 而非崩溃。
 #[test]
 fn attack_transport_failure_does_not_panic() {
-    use c_universe::handshake::{negotiate, Role};
+    use c_universe::handshake::{negotiate, IdentityKey, Role};
+
+    let key = IdentityKey::generate();
 
     struct FailingTransport;
     impl c_universe::handshake::Transport for FailingTransport {
@@ -189,7 +191,7 @@ fn attack_transport_failure_does_not_panic() {
         }
     }
 
-    let err = negotiate(Role::Initiator, &mut FailingTransport).unwrap_err();
+    let err = negotiate(Role::Initiator, &key, &mut FailingTransport).unwrap_err();
     assert_eq!(err, HandshakeError::Transport);
 
     // 读取方向同样不 panic。
@@ -203,7 +205,7 @@ fn attack_transport_failure_does_not_panic() {
             Err(std::io::Error::other("rst"))
         }
     }
-    let err = negotiate(Role::Responder, &mut ReadFail).unwrap_err();
+    let err = negotiate(Role::Responder, &key, &mut ReadFail).unwrap_err();
     assert_eq!(err, HandshakeError::Transport);
 }
 
@@ -214,15 +216,23 @@ fn attack_transport_failure_does_not_panic() {
 #[test]
 fn attack_directional_keys_are_isolated() {
     use c_universe::handshake::DhKeyPair;
+    use c_universe::handshake::{IdentityKey, Role};
     use c_universe::crypto;
     use c_universe::{Sender, SessionConfig as Cfg};
 
+    let key = IdentityKey::generate();
     let ka = DhKeyPair::generate();
     let kb = DhKeyPair::generate();
     let sa = random_bytes_32();
     let sb = random_bytes_32();
-    let (pa, _) = c_universe::handshake::parse_peer_frame(&ka.outbound_frame(&sa)).unwrap();
-    let (pb, _) = c_universe::handshake::parse_peer_frame(&kb.outbound_frame(&sb)).unwrap();
+    let (pa, _) = c_universe::handshake::parse_peer_frame(
+        &ka.outbound_frame(&sa, &key, Role::Initiator),
+    )
+    .unwrap();
+    let (pb, _) = c_universe::handshake::parse_peer_frame(
+        &kb.outbound_frame(&sb, &key, Role::Responder),
+    )
+    .unwrap();
     let combined = crypto::combine_session_salts(&sa, &sb);
     let (ir, ri) = ka.derive_directional_roots_with_salt(&pb, &combined).unwrap();
     let (ir_b, ri_b) = kb.derive_directional_roots_with_salt(&pa, &combined).unwrap();
@@ -420,16 +430,18 @@ fn attack_authentication_flood_triggers_o1_shed() {
 #[test]
 fn attack_handshake_capability_negotiation_blocks_downgrade() {
     use c_universe::handshake::{
-        parse_handshake_frame, parse_peer_frame, DhKeyPair, PROTOCOL_VERSION,
+        parse_handshake_frame, parse_peer_frame, DhKeyPair, IdentityKey, Role, PROTOCOL_VERSION,
         REQUIRED_CAPABILITIES,
     };
 
+    let key = IdentityKey::generate();
     let kp = DhKeyPair::generate();
     let salt = random_bytes_32();
-    let frame = kp.outbound_frame(&salt);
+    // 帧按「对端」视角构造（Responder），由本地以 Initiator 身份解析并认证。
+    let frame = kp.outbound_frame(&salt, &key, Role::Responder);
 
-    // 正常 V1.2 帧：版本与必需能力位齐全，协商通过。
-    let hf = parse_handshake_frame(&frame).unwrap();
+    // 正常 V1.2 帧：版本与必需能力位齐全，身份认证通过。
+    let hf = parse_handshake_frame(&frame, &key, Role::Initiator).unwrap();
     assert_eq!(hf.version, PROTOCOL_VERSION);
     assert_eq!(hf.capabilities & REQUIRED_CAPABILITIES, REQUIRED_CAPABILITIES);
     // 公钥 / 盐按新帧布局解析一致。
@@ -440,7 +452,7 @@ fn attack_handshake_capability_negotiation_blocks_downgrade() {
     // 降级对端：方向化能力位缺失 → 拒绝（封死旧客户端降级到单一 root 模式）。
     let mut downgraded = frame;
     downgraded[1] = 0;
-    let err = parse_handshake_frame(&downgraded).unwrap_err();
+    let err = parse_handshake_frame(&downgraded, &key, Role::Initiator).unwrap_err();
     assert!(
         matches!(err, HandshakeError::IncompatiblePeer { .. }),
         "missing-directional-capability frame must be rejected, got {err:?}"
@@ -448,6 +460,51 @@ fn attack_handshake_capability_negotiation_blocks_downgrade() {
 
     // 旧格式（64 字节，无版本/能力头）→ 帧长不符 → 拒绝，而非清白解析后降级。
     let legacy = &frame[..64];
-    let err = parse_handshake_frame(legacy).unwrap_err();
+    let err = parse_handshake_frame(legacy, &key, Role::Initiator).unwrap_err();
     assert_eq!(err, HandshakeError::BadPeerPayload(64));
+}
+
+/// 攻击 ⑬ —— 无身份认证 / MITM（未知身份密钥插值）。
+///
+/// 若无身份认证，攻击者 M 可插在被攻击双方 A、B 之间，各做一次独立 DH，
+/// 冒充 B 与 A、冒充 A 与 B。现在 `negotiate` 强制 Key-Confirmation：
+/// M 不持有双方共享的身份密钥，无法产出让 A（或 B）认证通过的握手帧。
+///
+/// 断言：
+/// 1. 正确身份密钥 → 解析通过（正控制）；
+/// 2. 未知（攻击者）身份密钥产出的握手帧 → `AuthenticationFailed`；
+/// 3. 合法帧被单字节篡改 → `AuthenticationFailed`（认证器同时保完整）。
+#[test]
+fn attack_unknown_identity_key_is_rejected() {
+    use c_universe::handshake::{parse_handshake_frame, AUTH_OFFSET, DhKeyPair, IdentityKey, Role};
+
+    // A、B 双方共享同一身份密钥；攻击者 M 持另一把（随机生成、几乎必然不同）。
+    let key_ab = IdentityKey::generate();
+    let key_attacker = IdentityKey::generate();
+
+    // 合法对端 B（Responder）用共享密钥产帧。
+    let bob = DhKeyPair::generate();
+    let bob_salt = random_bytes_32();
+    let bob_frame = bob.outbound_frame(&bob_salt, &key_ab, Role::Responder);
+
+    // A 以正确密钥解析 → 应通过（正控制）。
+    let hf = parse_handshake_frame(&bob_frame, &key_ab, Role::Initiator).unwrap();
+    assert_eq!(hf.peer_public, bob.public_key());
+
+    // 攻击者 M 冒名 Responder 但持错误身份密钥 → 认证失配，会话被拒。
+    let mallory = DhKeyPair::generate();
+    let mallory_salt = random_bytes_32();
+    let mallory_frame = mallory.outbound_frame(&mallory_salt, &key_attacker, Role::Responder);
+    let err = parse_handshake_frame(&mallory_frame, &key_ab, Role::Initiator).unwrap_err();
+    assert_eq!(
+        err,
+        HandshakeError::AuthenticationFailed,
+        "unknown-identity handshake must be rejected, got {err:?}"
+    );
+
+    // 合法帧被篡改一个字节 → 认证器验证失败（完整性由认证器担保）。
+    let mut tampered = bob_frame;
+    tampered[AUTH_OFFSET] ^= 0x01;
+    let err = parse_handshake_frame(&tampered, &key_ab, Role::Initiator).unwrap_err();
+    assert_eq!(err, HandshakeError::AuthenticationFailed);
 }

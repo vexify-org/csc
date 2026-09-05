@@ -3,13 +3,15 @@
 use std::time::Duration;
 
 use c_universe::crypto;
-use c_universe::handshake::DhKeyPair;
+use c_universe::handshake::{parse_handshake_frame, DhKeyPair, IdentityKey, Role};
 use c_universe::packet::Packet;
 use c_universe::{ReceiveError, Receiver, SessionConfig, Sender};
 
 /// 握手两端能够得到**一致的方向化会话根种子对**（双向隔离）。
 #[test]
 fn handshake_reaches_common_directional_roots() {
+    // 双方共享同一预共享身份密钥（部署前带外分发）。
+    let key = IdentityKey::generate();
     // 双方各自生成 DH 密钥对与会话盐，并各自发出握手帧。
     let (ka, salt_a) = {
         let kp = DhKeyPair::generate();
@@ -22,8 +24,14 @@ fn handshake_reaches_common_directional_roots() {
         (kp, s)
     };
 
-    let frame_a = ka.outbound_frame(&salt_a);
-    let frame_b = kb.outbound_frame(&salt_b);
+    let frame_a = ka.outbound_frame(&salt_a, &key, Role::Initiator);
+    let frame_b = kb.outbound_frame(&salt_b, &key, Role::Responder);
+    // 双向交叉认证对端身份（各自以对端角色解析）：共享身份密钥下均应通过。
+    let hf_a = parse_handshake_frame(&frame_b, &key, Role::Initiator).unwrap();
+    let hf_b = parse_handshake_frame(&frame_a, &key, Role::Responder).unwrap();
+    // 身份认证通过后，对端公钥与纯载荷解析一致。
+    assert_eq!(hf_a.peer_public, kb.public_key());
+    assert_eq!(hf_b.peer_public, ka.public_key());
     // 从帧中解析对端公钥（等价于网络上交换）。
     let (pub_a, _) = c_universe::handshake::parse_peer_frame(&frame_a).unwrap();
     let (pub_b, _) = c_universe::handshake::parse_peer_frame(&frame_b).unwrap();

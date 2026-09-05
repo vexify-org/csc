@@ -10,6 +10,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::KEY_LEN;
@@ -26,8 +27,49 @@ pub const DIR_ROOT_INITIATOR_TO_RESPONDER: &[u8] =
 /// 双向隔离：Responder→Initiator 方向的域分离标签。
 pub const DIR_ROOT_RESPONDER_TO_INITIATOR: &[u8] =
     b"C-Universe-DirRoot-Responder-To-Initiator-v1.2";
+/// 握手身份认证器（Key-Confirmation）的域分离标签。
+///
+/// 独立于 KDF 的 info，避免与根种子 / 包密钥派生共用标签。
+pub const AUTH_INFO: &[u8] = b"C-Universe-Session-Auth-v1.3";
 /// AEAD nonce 长度（ChaCha20-Poly1305 标准 12 字节）。
 pub const NONCE_LEN: usize = 12;
+
+/// 对握手帧内容做身份认证（Key-Confirmation）。
+///
+/// 返回 `HMAC-SHA256(key = identity, msg = AUTH_INFO ‖ version‖capabilities‖role ‖ public ‖ salt)`
+/// 的 32 字节认证器。发送方将其附加在握手帧尾部，接收方用**同一把预共享身份密钥**
+/// 重算并与帧内携带值做常数时间对比 —— 只有持有该身份密钥的对端才能产出有效的认证器，
+/// 从而在 `negotiate` 内就把「无身份认证」的 MITM 关死：未知身份密钥的攻击者
+/// 无法提交带有效认证器的握手帧。
+pub fn authenticate_frame(
+    identity: &[u8; KEY_LEN],
+    version: u8,
+    capabilities: u8,
+    role: u8,
+    public: &[u8; KEY_LEN],
+    salt: &[u8; KEY_LEN],
+) -> [u8; KEY_LEN] {
+    // HMAC-SHA256 接受任意长度密钥；32 字节身份密钥必然合法。
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity)
+        .expect("HMAC accepts any key length");
+    mac.update(AUTH_INFO);
+    mac.update(&[version, capabilities, role]);
+    mac.update(public);
+    mac.update(salt);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; KEY_LEN];
+    out.copy_from_slice(&tag[..KEY_LEN]);
+    out
+}
+
+/// 常数时间比较两个 32 字节认证器，避免时序侧信道区分合法/伪造对端。
+pub fn ct_eq(a: &[u8; KEY_LEN], b: &[u8; KEY_LEN]) -> bool {
+    let mut acc: u8 = 0;
+    for i in 0..KEY_LEN {
+        acc |= a[i] ^ b[i];
+    }
+    acc == 0
+}
 
 /// 由握手双方各自生成、交换后拼接而成的会话盐（64 字节：A || B）。
 /// 每个会话唯一，参与根种子派生。
