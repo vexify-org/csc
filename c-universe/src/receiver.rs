@@ -36,6 +36,15 @@ impl Default for SessionConfig {
     }
 }
 
+/// 认证洪水熔断阈值：连续认证失败（伪造/错钥）达到该次数即触发全局 shed。
+///
+/// 这是「先认证后查状态」抗侧信道（漏洞侧信道修复）与「认证放大 CPU DoS」
+/// （漏洞 G）之间的可用性平衡点：单一伪造坐标不会触发，只有全局持续洪水才触发，
+/// 且触发不依赖任何逐 coord 内部状态，避免重新引入侧信道。
+const AUTH_FAILURE_SHED_THRESHOLD: u64 = 1_024;
+/// 触发认证洪水熔断后，拒绝新报文（不做 AEAD）的持续时间。
+const AUTH_SHED_WINDOW: Duration = Duration::from_secs(5);
+
 /// 接收处理错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReceiveError {
@@ -54,6 +63,14 @@ pub enum ReceiveError {
     /// 全局会话静默熔断已触发，需要重新握手。
     #[error("session expired (silent fuse tripped)")]
     SessionExpired,
+    /// 认证洪水熔断：短时间内伪造/错钥包过多，接收端进入按时间的全局 shed，
+    /// 以此换取 O(1) 拒绝持续认证放大攻击（`AuthenticationFailed` 不复用为状态侧信道）。
+    ///
+    /// 这是「先认证后查状态」抗侧信道策略下、对**全局探测性洪水**的可用性兜底：
+    /// 触发条件仅依赖全局认证失败计数（不随 coord/会话内部状态变化），因此
+    /// 不会向攻击者泄露「哪些 coord 已核销/已作废」这类逐 coord 状态。
+    #[error("authentication flood (admission shed active)")]
+    DoSLimit,
 }
 
 /// C-Universe 接收端状态机。
@@ -75,6 +92,10 @@ pub struct Receiver {
     started: Instant,
     /// 最近一次成功解密业务包的时刻（50s 熔断计时基准）。
     last_received: Option<Instant>,
+    /// 认证洪水熔断（漏洞 G）：累计连续认证失败次数。
+    auth_failures: u64,
+    /// 认证洪水熔断（漏洞 G）：shed 持续到该时刻为止，期间 O(1) 拒绝不做 AEAD。
+    shed_until: Option<Instant>,
 }
 
 impl Receiver {
@@ -90,6 +111,8 @@ impl Receiver {
             last_contiguous: -1,
             started: Self::now(),
             last_received: None,
+            auth_failures: 0,
+            shed_until: None,
         }
     }
 
@@ -122,6 +145,14 @@ impl Receiver {
         Ok(())
     }
 
+    /// 暴露内部记账规模（心电监控 / 内存有界性验证用）= `pending` 空缺窗口数 + `voided` 墓碑数。
+    ///
+    /// 漏洞 H 修复后，持续受控跳号下该值应稳定在 `O(max_gap_span)` 量级，
+    /// 而非随丢包/跳号次数线性增长；攻击者可据此验证接收端不会 OOM。
+    pub fn bookkeeping_len(&self) -> usize {
+        self.pending.len() + self.voided.len()
+    }
+
     /// 处理一个收到的报文。任何防御层拦截返回对应错误，调用方可据此打点/丢弃。
     ///
     /// # 顺序（抗侧信道）
@@ -136,15 +167,41 @@ impl Receiver {
     pub fn recv(&mut self, packet: &Packet) -> Result<Vec<u8>, ReceiveError> {
         let now = Self::now();
 
+        // 认证洪水熔断（漏洞 G）：shed 持续期内 O(1) 整体拒绝，省去逐包 AEAD，
+        //   杜绝攻击者以「已核销 coord 的伪造包仍需完整 ChaCha20-Poly1305 解密」
+        //   进行认证放大 CPU DoS。判决仅依赖全局时间窗 + 全局失败计数，
+        //   不随 coord/会话内部状态变化，因此不构成逐 coord 状态侧信道。
+        if let Some(until) = self.shed_until {
+            if now < until {
+                return Err(ReceiveError::DoSLimit);
+            }
+            // shed 窗口已过：复位计数，允许合法流量自愈。
+            self.shed_until = None;
+            self.auth_failures = 0;
+        }
+
         // 第一步：结构性解析（不依赖会话状态，不构成侧信道）。
         let header = packet.header().map_err(|_| ReceiveError::Malformed)?;
         let coord = header.coord;
 
         // 第二步：先密码学认证 —— 伪造/篡改/错钥在这里被统一拦截，
         //  绝不因网关前置检查把内部状态泄露给无密钥的攻击者。
-        let plaintext = packet
-            .decrypt(&self.seed)
-            .map_err(|_| ReceiveError::AuthenticationFailed)?;
+        //  任一合法包即复位连续失败计数（自愈）：唯有连续 1024 次认证失败
+        //  才会触发 `DoSLimit` 全局 shed。
+        let plaintext = match packet.decrypt(&self.seed) {
+            Ok(p) => {
+                self.auth_failures = 0;
+                p
+            }
+            Err(_) => {
+                self.auth_failures += 1;
+                if self.auth_failures >= AUTH_FAILURE_SHED_THRESHOLD {
+                    self.shed_until = Some(now + AUTH_SHED_WINDOW);
+                    self.auth_failures = 0;
+                }
+                return Err(ReceiveError::AuthenticationFailed);
+            }
+        };
 
         // 第三层：50s 静默熔断（首包前退化为会话建立时刻起算）。
         let anchor = self.last_received.unwrap_or(self.started);
@@ -234,11 +291,19 @@ impl Receiver {
             self.voided.insert(c);
             self.pending.remove(&c);
         }
-        // coord <= last_contiguous 的必已被 `used` 收纳，墓碑/pending 从此刻可释放。
-        // 仅在已建立连续前缀（>=0）时才收紧边界：首包若为 coord>0，`last_contiguous`
-        // 仍为 -1，此时 `(-1 as u64)` 是 u64::MAX，若直接 retain `c > bound` 会把
-        // 空缺窗口与墓碑全部清空且**不落作废**，导致低序号 coord 永不作废、可无限重放。
-        // 故在此类情形下禁止收紧，让空缺窗口存活到期并由上方分批转入 `voided`。
+        // —— 通用回收 ①：`voided_prefix` 之下的一切永久作废，且已由 recv 的
+        //   `coord < voided_prefix` O(1) 前缀判拒覆盖 —— 逐 coord 的墓碑/pending
+        //   记账自此冗余，可安全回收。回收不改变任何判拒语义，仅回收内存：
+        //   杜绝「低 coord 永久丢失时 voided 集合永不清理」的无界线性增长（漏洞 H/OOM）。
+        self.voided.retain(|&c| c >= self.voided_prefix);
+        self.pending.retain(|&c, _| c >= self.voided_prefix);
+
+        // —— 通用回收 ②：已建立连续前缀时，`<= last_contiguous` 的 coord 必已被
+        //   `used` 收纳。仅在 last_contiguous >= 0 时收紧：首包若为 coord>0，
+        //   last_contiguous 仍为 -1，此时 `(-1 as u64)` 是 u64::MAX，若直接
+        //   retain `c > bound` 会把空缺窗口与墓碑全部清空且**不落作废**，导致
+        //   低序号 coord 永不作废、可无限重放（漏洞 A）。故此时禁止收紧，
+        //   让空缺窗口存活到期，转入 `voided` 后经由①的前缀判拒与回收释放。
         if self.last_contiguous >= 0 {
             let bound = self.last_contiguous as u64;
             self.voided.retain(|&c| c > bound);

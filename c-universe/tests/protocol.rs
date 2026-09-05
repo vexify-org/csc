@@ -205,19 +205,23 @@ fn mismatched_session_root_cannot_decrypt() {
 fn crypto_layer_properties_hold() {
     use c_universe::crypto;
 
-    // ① HKDF 根种子：确定性 —— 相同输入必得相同输出。
+    // ① HKDF 根种子：确定性 —— 相同输入必得相同输出（方向化，非废弃的单 root）。
     let dh = c_universe::handshake::random_bytes_32();
     let salt = c_universe::handshake::random_bytes_32();
-    let a = crypto::derive_session_root(&dh, &salt);
-    let b = crypto::derive_session_root(&dh, &salt);
+    let (a, d) = crypto::derive_directional_roots(&dh, &salt);
+    let (b, e) = crypto::derive_directional_roots(&dh, &salt);
     assert_eq!(a, b);
+    assert_eq!(d, e);
+    assert_ne!(a, d); // 两方向互不相同（双向隔离）。
     // 换盐则根种子不同（盐承担会话随机化）。
     let salt2 = {
         let mut s = salt;
         s[0] ^= 1;
         s
     };
-    assert_ne!(a, crypto::derive_session_root(&dh, &salt2));
+    let (c, f) = crypto::derive_directional_roots(&dh, &salt2);
+    assert_ne!(a, c);
+    assert_ne!(d, f);
 
     // ② 逐包密钥：不同 coord 派生不同 K_n（序号隔离，报错不改跨包）。
     let k0 = crypto::derive_packet_key(&a, 0);

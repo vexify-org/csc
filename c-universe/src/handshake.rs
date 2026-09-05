@@ -19,8 +19,8 @@ use rand_core::{OsRng, RngCore};
 /// 握手过程暴露的协议错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HandshakeError {
-    /// 对端 DH 载荷长度非法（必须恰好 64 字节 = public_key(32) || salt(32)）。
-    #[error("invalid peer payload length {0} (expected 64)")]
+    /// 对端 DH 载荷长度非法（必须恰好 [`HANDSHAKE_FRAME_LEN`] 字节）。
+    #[error("invalid peer payload length {0} (expected {expected})", expected = HANDSHAKE_FRAME_LEN)]
     BadPeerPayload(usize),
     /// X25519 派生出全零共享密钥（对端公钥为低阶点），握手被强制拒绝。
     #[error("weak/zero DH shared secret (low-order peer public key)")]
@@ -30,7 +30,32 @@ pub enum HandshakeError {
     /// 返回错误而非 panic，避免攻击者以 RST/断开流的方式让握手进程崩溃。
     #[error("transport error during handshake")]
     Transport,
+    /// 对端握手帧版本 / 能力与本地不兼容。
+    ///
+    /// 握手帧携带协议版本与能力位图（含方向化密钥），一旦对方缺失所需能力，
+    /// 拒绝建立会话而非降级回单一 root 模式，封死旧客户端降级攻击（漏洞 F）。
+    #[error("incompatible peer during handshake (version {peer_version}, capabilities {capabilities:#010b}, required {required:#010b})")]
+    IncompatiblePeer {
+        /// 对端声明的协议版本。
+        peer_version: u8,
+        /// 对端声明的能力位图。
+        capabilities: u8,
+        /// 握手必需的能力位图。
+        required: u8,
+    },
 }
+
+/// 握手帧长度：`version(1) || capabilities(1) || public_key(32) || salt(32)`。
+pub const HANDSHAKE_FRAME_LEN: usize = 66;
+/// 本实现支持的协议版本。V1.2 对应的版本号 = 2。
+pub const PROTOCOL_VERSION: u8 = 2;
+/// 能力位：支持**方向化根种子**（双向链路密钥空间隔离，防跨方向重放）。
+pub const CAP_DIRECTIONAL_KEYS: u8 = 0b0000_0001;
+/// 握手成立**必须**满足的能力集。
+///
+/// 任何一方若声明的能力缺少本位，`negotiate` 将返回 [`HandshakeError::IncompatiblePeer`]，
+/// 拒绝降级到缺失该能力的（旧）单一 root 模式 —— 该模式下双向密钥可跨方向重放。
+pub const REQUIRED_CAPABILITIES: u8 = CAP_DIRECTIONAL_KEYS;
 
 /// 一方在一次握手中的地位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +93,17 @@ impl DhKeyPair {
         self.public
     }
 
-    /// 派生出待发送的握手帧 = public_key(32) || salt(32)。
-    pub fn outbound_frame(&self, salt: &[u8; 32]) -> [u8; 64] {
-        let mut f = [0u8; 64];
-        f[..32].copy_from_slice(&self.public);
-        f[32..].copy_from_slice(salt);
+    /// 派生出待发送的握手帧 =
+    /// `version(1) || capabilities(1) || public_key(32) || salt(32)`。
+    ///
+    /// 帧头携带协议版本与能力位图，使对端能在派生密钥前进行能力协商；
+    /// 缺失必需能力的对端将连接失败，而非静默降级（见 [`REQUIRED_CAPABILITIES`]）。
+    pub fn outbound_frame(&self, salt: &[u8; 32]) -> [u8; HANDSHAKE_FRAME_LEN] {
+        let mut f = [0u8; HANDSHAKE_FRAME_LEN];
+        f[0] = PROTOCOL_VERSION;
+        f[1] = CAP_DIRECTIONAL_KEYS;
+        f[2..34].copy_from_slice(&self.public);
+        f[34..].copy_from_slice(salt);
         f
     }
 
@@ -87,6 +118,18 @@ impl DhKeyPair {
     ///
     /// 执行 RFC 7748 规定的最低限校验：拒绝产生全零共享密钥的低阶点公钥，
     /// 避免握手被注入弱密钥。仅在 QUIC-TLS 校验完成、确认对方是可信对端后方可调用。
+    ///
+    /// # 废弃（漏洞 F：旧 API 未废弃 → 降级 / 跨方向重放）
+    ///
+    /// 单一根种子 `S₀` 在双向通信下会让两个方向在相同 coord 产生**完全一致**的
+    /// 单包密钥，攻击者可跨方向解密与重放。请改用 [`DhKeyPair::derive_directional_roots_with_salt`]
+    /// 派生互不相同的方向根；本方法仅保留以兼容旧集成，**已废弃**，正被移除。
+    #[deprecated(
+        since = "1.2.0",
+        note = "single-root S0 is insecure for bidirectional links (cross-direction replay); use derive_directional_roots_with_salt instead. This is a downgrade vector and is scheduled for removal."
+    )]
+    // 本方法自身已废弃，内部再经同样废弃的版本来实现是预期的兼容垫片。
+    #[allow(deprecated)]
     pub fn derive_session_root_with_salt(
         &self,
         peer_public: &[u8; 32],
@@ -122,16 +165,60 @@ impl DhKeyPair {
     }
 }
 
-/// 解析一帧对端握手数据。
+/// 解析一帧对端握手数据，取出公钥与会话盐。
+///
+/// 纯载荷提取，**不校验**版本与能力（供审计验证 / 单元测试直接使用）。
+/// 生产握手请走 [`parse_handshake_frame`]，它会强制版本与能力协商。
 pub fn parse_peer_frame(frame: &[u8]) -> Result<([u8; 32], [u8; 32]), HandshakeError> {
-    if frame.len() != 64 {
+    if frame.len() != HANDSHAKE_FRAME_LEN {
         return Err(HandshakeError::BadPeerPayload(frame.len()));
     }
     let mut peer_pub = [0u8; 32];
     let mut peer_salt = [0u8; 32];
-    peer_pub.copy_from_slice(&frame[..32]);
-    peer_salt.copy_from_slice(&frame[32..64]);
+    peer_pub.copy_from_slice(&frame[2..34]);
+    peer_salt.copy_from_slice(&frame[34..HANDSHAKE_FRAME_LEN]);
     Ok((peer_pub, peer_salt))
+}
+
+/// 对端握手帧的解析结果（含版本与能力位图）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeFrame {
+    /// 对端声明的协议版本。
+    pub version: u8,
+    /// 对端声明的能力位图。
+    pub capabilities: u8,
+    /// 对端 DH 公钥。
+    pub peer_public: [u8; 32],
+    /// 对端会话盐。
+    pub peer_salt: [u8; 32],
+}
+
+/// 解析对端握手帧，并执行**版本 + 能力协商**。
+///
+/// 若对端版本 ≠ [`PROTOCOL_VERSION`]，或对端能力缺少 [`REQUIRED_CAPABILITIES`]
+/// （即方向化密钥），返回 [`HandshakeError::IncompatiblePeer`] —— **拒绝建立会话**，
+/// 而非静默降级回单一 root 模式（该模式允许跨方向重放，漏洞 F）。
+pub fn parse_handshake_frame(frame: &[u8]) -> Result<HandshakeFrame, HandshakeError> {
+    if frame.len() != HANDSHAKE_FRAME_LEN {
+        return Err(HandshakeError::BadPeerPayload(frame.len()));
+    }
+    let hf = HandshakeFrame {
+        version: frame[0],
+        capabilities: frame[1],
+        peer_public: <[u8; 32]>::try_from(&frame[2..34]).expect("slice is exactly 32 bytes"),
+        peer_salt: <[u8; 32]>::try_from(&frame[34..HANDSHAKE_FRAME_LEN])
+            .expect("slice is exactly 32 bytes"),
+    };
+    if hf.version != PROTOCOL_VERSION
+        || (hf.capabilities & REQUIRED_CAPABILITIES) != REQUIRED_CAPABILITIES
+    {
+        return Err(HandshakeError::IncompatiblePeer {
+            peer_version: hf.version,
+            capabilities: hf.capabilities,
+            required: REQUIRED_CAPABILITIES,
+        });
+    }
+    Ok(hf)
 }
 
 /// RFC 7748：拒绝全零共享密钥，避免低阶点注入弱密钥。
@@ -205,11 +292,15 @@ pub fn negotiate<T: Transport>(
     transport
         .reliable_write(&outbound)
         .map_err(|_| HandshakeError::Transport)?;
-    let mut frame = [0u8; 64];
+    let mut frame = [0u8; HANDSHAKE_FRAME_LEN];
     transport
         .reliable_read_exact(&mut frame)
         .map_err(|_| HandshakeError::Transport)?;
-    let (peer_pub, peer_salt) = parse_peer_frame(&frame)?;
+    // 版本 + 能力协商：对端缺失方向化密钥能力时直接拒绝，绝不降级回
+    // 单一 root 模式（该模式允许跨方向重放 / 旧客户端降级，见漏洞 F/I）。
+    let peer = parse_handshake_frame(&frame)?;
+    let peer_pub = peer.peer_public;
+    let peer_salt = peer.peer_salt;
 
     // 双方盐拼接；角色顺序固定为 A||B 以保证两端一致。
     let combined = match role {

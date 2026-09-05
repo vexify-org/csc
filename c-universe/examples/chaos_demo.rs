@@ -113,6 +113,10 @@ fn main() {
                 println!("[!] 会话熔断（演示全程有包，正常不会触发）");
                 break;
             }
+            Err(ReceiveError::DoSLimit) => {
+                println!("[!] 认证洪水熔断（安全演示不会触发）");
+                break;
+            }
             Err(ReceiveError::Malformed) => unreachable!("demo packets are well-formed"),
         }
     }

@@ -132,7 +132,7 @@ fn hardened_mega_coord_jump_is_bounded() {
 /// 双方会派生出**全零共享密钥** `S₀=[0;32]`，攻击者据此可预测整条会话，
 /// 重放 / 伪造任意报文。这正是上次加固（RFC 7748 校验）要封死的口子。
 ///
-/// 断言：`derive_session_root_with_salt` 遇到低阶点公钥必须返回
+/// 断言：`derive_directional_roots_with_salt` 遇到低阶点公钥必须返回
 /// `WeakDhSecret`，而不是静默产出可预测密钥。
 #[test]
 fn attack_low_order_point_injection_rejected() {
@@ -147,7 +147,7 @@ fn attack_low_order_point_injection_rejected() {
     // 已知低阶点：u=0（全零公钥），RFC 7748 标准 X25519 下共享密钥恒为零。
     let low_order_zero = [0u8; 32];
     let err = kp
-        .derive_session_root_with_salt(&low_order_zero, &combined)
+        .derive_directional_roots_with_salt(&low_order_zero, &combined)
         .unwrap_err();
     assert_eq!(err, HandshakeError::WeakDhSecret);
 
@@ -155,16 +155,18 @@ fn attack_low_order_point_injection_rejected() {
     let mut low_order_one = [0u8; 32];
     low_order_one[0] = 1;
     let err = kp
-        .derive_session_root_with_salt(&low_order_one, &combined)
+        .derive_directional_roots_with_salt(&low_order_one, &combined)
         .unwrap_err();
     assert_eq!(err, HandshakeError::WeakDhSecret);
 
-    // 对照：正常公钥必须仍能派生出非零根种子，证明校验只拦低阶点。
+    // 对照：正常公钥必须仍能派生出两组非零方向根，证明校验只拦低阶点。
     let legit_pub = DhKeyPair::generate().public_key();
-    let root = kp
-        .derive_session_root_with_salt(&legit_pub, &combined)
+    let (ir, ri) = kp
+        .derive_directional_roots_with_salt(&legit_pub, &combined)
         .unwrap();
-    assert_ne!(root, [0u8; 32]);
+    assert_ne!(ir, [0u8; 32]);
+    assert_ne!(ri, [0u8; 32]);
+    assert_ne!(ir, ri);
 }
 
 /// 攻击 ⑤ —— 握手 panic DoS（RST 崩溃服务）。
@@ -343,4 +345,109 @@ fn attack_session_times_out_before_first_packet() {
     let mut tx = Sender::new(&root);
     let err = rx.recv(&tx.send(b"first")).unwrap_err();
     assert_eq!(err, ReceiveError::SessionExpired);
+}
+
+/// 攻击 ⑩ —— H：`voided` 内存泄漏 / OOM。
+///
+/// 修复漏洞 A 时对 `evict_expired` 的收紧加上了 `last_contiguous >= 0` 门槛；
+/// 若 coord 0 永久丢失（首包即便重试也到不了），连续边界永不建立，墓碑 `voided`
+/// 随每次巨跳线性累积且从不回收 → 持续丢包即 OOM。
+///
+/// 断言：修复后内部记账规模（pending + voided）始终处于 `O(max_gap_span)`，
+/// 即使做 2000 次巨跳也只稳定在常数级，而非随时间线性增长。
+#[test]
+fn attack_voided_bookkeeping_is_bounded() {
+    use c_universe::packet::Packet;
+    let root = random_bytes_32();
+    // 刻意小 `max_gap_span`，放大「每跳开一窗、窗口落入前缀下方必须被回收」的区分度。
+    let cfg = SessionConfig {
+        gap_window: Duration::from_secs(30),
+        session_timeout: Duration::from_secs(50),
+        max_gap_span: 8,
+    };
+    let mut rx = Receiver::new(&root, cfg);
+
+    // 序 0 永不投递 → last_contiguous 恒为 -1（漏洞 A 场景的核心触发条件）。
+    let mut peak = 0usize;
+    for i in 0..2000u64 {
+        let coord = 10_000 + i * 1_000; // 每跳跨度都远超 cap，必然推进 voided_prefix
+        rx.recv(&Packet::new(&root, coord, b"pay")).unwrap();
+        peak = peak.max(rx.bookkeeping_len());
+    }
+
+    // 有界断言：正常流（丢包/错序）下记账量随 cap=8 有限，绝不线性扩张。
+    assert!(
+        peak <= 64,
+        "bookkeeping grew to {peak}: voided memory leak / OOM (vuln H) regressed"
+    );
+}
+
+/// 攻击 ⑪ —— G：认证放大 CPU DoS。
+///
+/// 抗侧信道要求「先 Auth 后查状态」，因此已核销 coord 的伪造包也需完整 AEAD 解密，
+/// 攻击者可借此放大 CPU 开销。断言：连续认证洪水越过阈值后，接受端进入 O(1) 的
+/// 全局 shed（`DoSLimit`），不再为后续伪造包付出逐包解密成本；且此判决仅依赖全局
+/// 状态，不泄露 per-coord 状态（不破坏抗侧信道）。
+#[test]
+fn attack_authentication_flood_triggers_o1_shed() {
+    use c_universe::packet::Packet;
+    let mut rx = Receiver::with_defaults(&[3u8; 32]);
+
+    // 用错钥连续投递伪造包（永远 AuthenticationFailed）。
+    let mut shed_reached = false;
+    for i in 0..4096u64 {
+        let forged = Packet::new(&[9u8; 32], i, b"evil");
+        match rx.recv(&forged) {
+            Err(ReceiveError::DoSLimit) => {
+                shed_reached = true;
+                break;
+            }
+            Err(ReceiveError::AuthenticationFailed) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    assert!(
+        shed_reached,
+        "authentication flood did not trigger O(1) admission shed (vuln G)"
+    );
+}
+
+/// 攻击 ⑫ —— I：握手无能力协商（可降级 / 混版本互操作失败）。
+///
+/// 旧握手帧仅 `pubkey || salt`，无版本/能力字段，旧客户端可静默降级回单一 root 模式。
+/// 断言：V1.2 帧携带版本与能力位图；缺失方向化能力（或旧 64 字节格式）的对端
+/// 必须被 `IncompatiblePeer` / `BadPeerPayload` 拒绝，绝不降级。
+#[test]
+fn attack_handshake_capability_negotiation_blocks_downgrade() {
+    use c_universe::handshake::{
+        parse_handshake_frame, parse_peer_frame, DhKeyPair, PROTOCOL_VERSION,
+        REQUIRED_CAPABILITIES,
+    };
+
+    let kp = DhKeyPair::generate();
+    let salt = random_bytes_32();
+    let frame = kp.outbound_frame(&salt);
+
+    // 正常 V1.2 帧：版本与必需能力位齐全，协商通过。
+    let hf = parse_handshake_frame(&frame).unwrap();
+    assert_eq!(hf.version, PROTOCOL_VERSION);
+    assert_eq!(hf.capabilities & REQUIRED_CAPABILITIES, REQUIRED_CAPABILITIES);
+    // 公钥 / 盐按新帧布局解析一致。
+    let (pub_, salt_) = parse_peer_frame(&frame).unwrap();
+    assert_eq!(pub_, kp.public_key());
+    assert_eq!(salt_, salt);
+
+    // 降级对端：方向化能力位缺失 → 拒绝（封死旧客户端降级到单一 root 模式）。
+    let mut downgraded = frame;
+    downgraded[1] = 0;
+    let err = parse_handshake_frame(&downgraded).unwrap_err();
+    assert!(
+        matches!(err, HandshakeError::IncompatiblePeer { .. }),
+        "missing-directional-capability frame must be rejected, got {err:?}"
+    );
+
+    // 旧格式（64 字节，无版本/能力头）→ 帧长不符 → 拒绝，而非清白解析后降级。
+    let legacy = &frame[..64];
+    let err = parse_handshake_frame(legacy).unwrap_err();
+    assert_eq!(err, HandshakeError::BadPeerPayload(64));
 }
