@@ -72,6 +72,12 @@ pub const AUTHER_LEN: usize = 32;
 pub const PROTOCOL_VERSION: u8 = 2;
 /// 能力位：支持**方向化根种子**（双向链路密钥空间隔离，防跨方向重放）。
 pub const CAP_DIRECTIONAL_KEYS: u8 = 0b0000_0001;
+/// 能力位：支持 **PKI 证书身份认证**（Ed25519 身份签名 + 根 CA 验证）。
+///
+/// 该位为置起时，握手改走 [`outbound_frame_pki`] / [`parse_handshake_frame_pki`] /
+/// [`negotiate_pki`]：身份由长期签名密钥 + 自建根 CA 证书承担，替代（或并存于）PSK
+/// Key-Confirmation。PSK 兜底入口仍是 [`outbound_frame`] / [`parse_handshake_frame`]。
+pub const CAP_PKI: u8 = 0b0000_0010;
 /// 角色字节：Initiator 的编码（纳入身份认证器的角色绑定，防角色混淆）。
 pub const ROLE_INITIATOR: u8 = 0x01;
 /// 角色字节：Responder 的编码。
@@ -692,4 +698,161 @@ pub fn negotiate<T: Transport>(
 /// 便捷：验证给定公钥是否在受信任指纹集合中（自签证书指纹比对场景）。
 pub fn is_trusted_peer(peer_public: &[u8; 32], trusted_set: &[[u8; 32]]) -> bool {
     trusted_set.iter().any(|t| t == peer_public)
+}
+
+// ---------------------------------------------------------------------------
+// PKI 握手（Ed25519 身份签名 + 根 CA 验证）
+// ---------------------------------------------------------------------------
+
+/// PKI 握手帧长度（字节）：
+/// `version(1) || capabilities(1) || dh_public(32) || salt(32) || identity_pub(32) ||
+/// identity_sig(64) || ca_sig(64)`。
+pub const PKI_FRAME_LEN: usize = 226;
+/// PKI 握手帧中 DH 临时公钥的起始偏移。
+pub const PKI_DH_OFFSET: usize = 2;
+/// PKI 握手帧中会话盐的起始偏移。
+pub const PKI_SALT_OFFSET: usize = 34;
+/// PKI 握手帧中身份公钥的起始偏移。
+pub const PKI_IDENTITY_OFFSET: usize = 66;
+/// PKI 握手帧中身份签名（对 DH 交换片段）的起始偏移。
+pub const PKI_IDENT_SIG_OFFSET: usize = 98;
+/// PKI 握手帧中 CA 叶子证书（对身份公钥的签名）的起始偏移。
+pub const PKI_CA_SIG_OFFSET: usize = 162;
+
+/// PKI 握手帧的解析结果（身份认证通过后）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkiHandshakeFrame {
+    /// 对端声明的协议版本。
+    pub version: u8,
+    /// 对端声明的能力位图。
+    pub capabilities: u8,
+    /// 对端临时 DH 公钥。
+    pub peer_public: [u8; 32],
+    /// 对端会话盐。
+    pub peer_salt: [u8; 32],
+    /// 对端受 CA 授权的长期身份公钥。
+    pub identity: [u8; 32],
+}
+
+/// 构建一张 PKI 握手帧：
+/// `version(1) || caps(1) || dh_pub(32) || salt(32) || identity_pub(32) || identity_sig(64) || ca_sig(64)`。
+///
+/// 身份签名覆盖 `role ‖ version ‖ caps ‖ 本端 DH 公钥 ‖ 本端盐`（见
+/// [`crate::pki::handshake_transcript`]），把角色 / 方向 / 本轮 DH 交换全部绑定进签名。
+pub fn outbound_frame_pki(
+    dh: &DhKeyPair,
+    salt: &[u8; 32],
+    role: Role,
+    identity: &crate::pki::CertifiedIdentity,
+) -> [u8; PKI_FRAME_LEN] {
+    let mut f = [0u8; PKI_FRAME_LEN];
+    let caps = CAP_DIRECTIONAL_KEYS | CAP_PKI;
+    f[0] = PROTOCOL_VERSION;
+    f[1] = caps;
+    f[PKI_DH_OFFSET..PKI_SALT_OFFSET].copy_from_slice(&dh.public);
+    f[PKI_SALT_OFFSET..PKI_IDENTITY_OFFSET].copy_from_slice(salt);
+    let id_pub = identity.public_bytes();
+    f[PKI_IDENTITY_OFFSET..PKI_IDENT_SIG_OFFSET].copy_from_slice(&id_pub);
+    let transcript = crate::pki::handshake_transcript(role, PROTOCOL_VERSION, caps, &dh.public, salt);
+    let sig = identity.sign(&transcript);
+    f[PKI_IDENT_SIG_OFFSET..PKI_CA_SIG_OFFSET].copy_from_slice(&sig);
+    let ca_sig = identity.ca_signature();
+    f[PKI_CA_SIG_OFFSET..].copy_from_slice(&ca_sig);
+    f
+}
+
+/// 解析并认证一张 PKI 握手帧，执行 **版本/能力协商 + 证书与签名双重身份认证**。
+///
+/// 1. 长度校验（必须恰好 [`PKI_FRAME_LEN`] 字节）；
+/// 2. 版本 / 能力协商：对端必须是本协议版本且具 [`CAP_PKI`] 能力；否则
+///    [`HandshakeError::IncompatiblePeer`]；
+/// 3. **CA 授权**：`verify_cert(trusted_root, identity_pub, ca_sig)` —— 帧内身份公钥必须
+///    由 pin 的根 CA 签发（未受信身份 → [`HandshakeError::AuthenticationFailed`]）；
+/// 4. **身份签名**：`verify_transcript(identity_pub, transcript, identity_sig)` ——
+///    证明身份私钥持有者确实参与了本轮 DH 交换（MITM / 篡改 → 认证失败）。
+pub fn parse_handshake_frame_pki(
+    frame: &[u8],
+    local_role: Role,
+    trusted_root: &[u8; 32],
+) -> Result<PkiHandshakeFrame, HandshakeError> {
+    if frame.len() != PKI_FRAME_LEN {
+        return Err(HandshakeError::BadPeerPayload(frame.len()));
+    }
+    let peer_role = match local_role {
+        Role::Initiator => Role::Responder,
+        Role::Responder => Role::Initiator,
+    };
+    let version = frame[0];
+    let capabilities = frame[1];
+    if version != PROTOCOL_VERSION || (capabilities & CAP_PKI) == 0 {
+        return Err(HandshakeError::IncompatiblePeer {
+            peer_version: version,
+            capabilities,
+            required: CAP_DIRECTIONAL_KEYS | CAP_PKI,
+        });
+    }
+    let peer_public: [u8; 32] = frame[PKI_DH_OFFSET..PKI_SALT_OFFSET].try_into().expect("exact 32");
+    let peer_salt: [u8; 32] = frame[PKI_SALT_OFFSET..PKI_IDENTITY_OFFSET].try_into().expect("exact 32");
+    let identity: [u8; 32] = frame[PKI_IDENTITY_OFFSET..PKI_IDENT_SIG_OFFSET].try_into().expect("exact 32");
+    let ident_sig: [u8; crate::pki::SIG_LEN] =
+        frame[PKI_IDENT_SIG_OFFSET..PKI_CA_SIG_OFFSET].try_into().expect("exact 64");
+    let ca_sig: [u8; crate::pki::SIG_LEN] = frame[PKI_CA_SIG_OFFSET..].try_into().expect("exact 64");
+
+    // ① CA 授权：身份公钥必须由可信根 CA 签发。
+    if !crate::pki::verify_cert(trusted_root, &identity, &ca_sig) {
+        return Err(HandshakeError::AuthenticationFailed);
+    }
+    // ② 身份签名：绑定「以对端角色身份参与了本轮 DH 交换」。
+    let transcript = crate::pki::handshake_transcript(peer_role, version, capabilities, &peer_public, &peer_salt);
+    if !crate::pki::verify_transcript(&identity, &transcript, &ident_sig) {
+        return Err(HandshakeError::AuthenticationFailed);
+    }
+    Ok(PkiHandshakeFrame {
+        version,
+        capabilities,
+        peer_public,
+        peer_salt,
+        identity,
+    })
+}
+
+/// 在任意满足 [`Transport`] 的信道上的 PKI 握手（单端视角）。
+///
+/// 与 [`negotiate`] 等价，但身份认证依赖 **Ed25519 证书 + 根 CA**，而非 PSK：
+/// - 发送端含身份公钥 + 身份签名 + CA 叶子证书；
+/// - 接收端以 pin 的根 CA 验证证书，再以身份公钥验证身份签名；
+/// - 双重校验失败一律 [`HandshakeError::AuthenticationFailed`]，不会与未知/伪造身份建连。
+///
+/// `identity` 为端侧长期签名身份（由 [`crate::pki::RootCa::issue`] 签发），
+/// `trusted_root` 为部署时 pin 到本端的根 CA 公钥（[`crate::pki::RootCa::trust_root`]）。
+pub fn negotiate_pki<T: Transport>(
+    role: Role,
+    identity: &crate::pki::CertifiedIdentity,
+    trusted_root: &[u8; 32],
+    transport: &mut T,
+) -> Result<HandshakeSession, HandshakeError> {
+    let kp = DhKeyPair::generate();
+    let salt = random_bytes_32();
+    let outbound = outbound_frame_pki(&kp, &salt, role, identity);
+    transport
+        .reliable_write(&outbound)
+        .map_err(|_| HandshakeError::Transport)?;
+    let mut frame = [0u8; PKI_FRAME_LEN];
+    transport
+        .reliable_read_exact(&mut frame)
+        .map_err(|_| HandshakeError::Transport)?;
+    let peer = parse_handshake_frame_pki(&frame, role, trusted_root)?;
+    let combined = match role {
+        Role::Initiator => crypto::combine_session_salts(&salt, &peer.peer_salt),
+        Role::Responder => crypto::combine_session_salts(&peer.peer_salt, &salt),
+    };
+    let (root_initiator_to_responder, root_responder_to_initiator) =
+        kp.derive_directional_roots_with_salt(&peer.peer_public, &combined)?;
+    Ok(HandshakeSession {
+        keypair: kp,
+        role,
+        root_initiator_to_responder,
+        root_responder_to_initiator,
+        session_salt: salt,
+    })
 }

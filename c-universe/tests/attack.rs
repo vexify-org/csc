@@ -661,3 +661,117 @@ fn attack_header_protection_hides_coord() {
     // ⑤ 持错误根种子的观察者无法恢复（乱猜必错）。
     assert_ne!(net.recover_coord(&[0xAA; 32]), Some(0));
 }
+
+/// 攻击 ⑱ —— PKI 身份握手：证书 + 签名双重认证，双方鉴出同一方向根。
+///
+/// 上 PKI（Ed25519 身份签名 + 自建根 CA）：
+/// - 双方各持由可信根 CA 签发的长期身份，握手帧携带 身份公钥 + 身份签名 + CA 叶子证书；
+/// - 验证侧先验**CA 授权**（根 CA 已签发该身份），再验**身份签名**（私钥持有者参与了
+///   本轮 DH 交换）—— 双重校验，两者任一不过即拒绝；
+/// - DH 共享密钥/方向根在认证通过后照常派生，两端一致。
+#[test]
+fn attack_pki_handshake_mutually_authenticates_and_reaches_common_root() {
+    use c_universe::handshake::{
+        outbound_frame_pki, parse_handshake_frame_pki, random_bytes_32, DhKeyPair, Role,
+    };
+    use c_universe::pki::RootCa;
+
+    // 自建根 CA，为 A、B 各签发一份身份（CA 私钥仅留在签发端）。
+    let ca = RootCa::generate();
+    let root = ca.trust_root();
+    let id_a = ca.issue();
+    let id_b = ca.issue();
+
+    // 双方各自生成临时 DH 密钥对与会话盐，构建 PKI 握手帧。
+    let ka = DhKeyPair::generate();
+    let kb = DhKeyPair::generate();
+    let salt_a = random_bytes_32();
+    let salt_b = random_bytes_32();
+    let frame_a = outbound_frame_pki(&ka, &salt_a, Role::Initiator, &id_a);
+    let frame_b = outbound_frame_pki(&kb, &salt_b, Role::Responder, &id_b);
+
+    // 双向交叉认证：以「对端角色」解析，证书 + 签名双校验必须通过。
+    let hf_a = parse_handshake_frame_pki(&frame_b, Role::Initiator, &root).unwrap();
+    let hf_b = parse_handshake_frame_pki(&frame_a, Role::Responder, &root).unwrap();
+    assert_eq!(hf_a.identity, id_b.public_bytes());
+    assert_eq!(hf_b.identity, id_a.public_bytes());
+    assert_ne!(hf_a.identity, hf_b.identity, "两端身份应不同");
+
+    // 认证通过后按固定顺序拼接双方盐，派生方向根，两端一致。
+    let combined = crypto::combine_session_salts(&salt_a, &salt_b);
+    let (ir_a, ri_a) = ka
+        .derive_directional_roots_with_salt(&hf_a.peer_public, &combined)
+        .unwrap();
+    let (ir_b, ri_b) = kb
+        .derive_directional_roots_with_salt(&hf_b.peer_public, &combined)
+        .unwrap();
+    assert_eq!(ir_a, ir_b);
+    assert_eq!(ri_a, ri_b);
+}
+
+/// 攻击 ⑲ —— PKI 握手：未受本 CA 授权的身份 / 帧篡改 / 坏信任根，一律拒绝。
+///
+/// MITM 若无本根 CA 签发的有效身份，或篡改握手帧，或受害者验证侧 pin 了错误的信任根，
+/// 身份认证必须失败（[`HandshakeError::AuthenticationFailed`]），绝不建连。
+#[test]
+fn attack_pki_untrusted_identity_and_tamper_rejected() {
+    use c_universe::handshake::{
+        outbound_frame_pki, parse_handshake_frame_pki, random_bytes_32, DhKeyPair, Role,
+    };
+    use c_universe::pki::RootCa;
+
+    let ca = RootCa::generate();
+    let root = ca.trust_root();
+    let id_b = ca.issue();
+    let kb = DhKeyPair::generate();
+    let salt_b = random_bytes_32();
+    let frame_b = outbound_frame_pki(&kb, &salt_b, Role::Responder, &id_b);
+
+    // 正控制：可信根下，合法身份通过。
+    parse_handshake_frame_pki(&frame_b, Role::Initiator, &root).unwrap();
+
+    // ① 攻击者持「别的 CA」签发的身份（在此信任根下不被授权）→ 拒绝。
+    let evil_ca = RootCa::generate();
+    let evil_id = evil_ca.issue();
+    let ke = DhKeyPair::generate();
+    let salt_e = random_bytes_32();
+    let frame_evil = outbound_frame_pki(&ke, &salt_e, Role::Responder, &evil_id);
+    let err = parse_handshake_frame_pki(&frame_evil, Role::Initiator, &root).unwrap_err();
+    assert_eq!(
+        err,
+        HandshakeError::AuthenticationFailed,
+        "未受本根 CA 授权的身份不得通过认证"
+    );
+
+    // ② 验证侧 pin 了**错误**信任根 → 合法身份的证书验证失败。
+    let other_root = RootCa::generate().trust_root();
+    let err = parse_handshake_frame_pki(&frame_b, Role::Initiator, &other_root).unwrap_err();
+    assert_eq!(
+        err,
+        HandshakeError::AuthenticationFailed,
+        "pin 错信任根必须导致认证失败"
+    );
+
+    // ③ 篡改握手帧任一字节（此处改身份签名）→ 身份签名校验失败。
+    let mut tampered = frame_b;
+    // 身份签名位于 PKI_IDENT_SIG_OFFSET..PKI_CA_SIG_OFFSET，取其中一字节翻转。
+    use c_universe::handshake::PKI_IDENT_SIG_OFFSET;
+    tampered[PKI_IDENT_SIG_OFFSET] ^= 0x01;
+    let err = parse_handshake_frame_pki(&tampered, Role::Initiator, &root).unwrap_err();
+    assert_eq!(
+        err,
+        HandshakeError::AuthenticationFailed,
+        "篡改握手帧必须导致认证失败"
+    );
+
+    // ④ 篡改临时 DH 公钥 → 身份签名（绑定 DH 公钥）校验失败。
+    let mut tampered_dh = frame_b;
+    use c_universe::handshake::PKI_DH_OFFSET;
+    tampered_dh[PKI_DH_OFFSET] ^= 0x01;
+    let err = parse_handshake_frame_pki(&tampered_dh, Role::Initiator, &root).unwrap_err();
+    assert_eq!(
+        err,
+        HandshakeError::AuthenticationFailed,
+        "篡改 DH 公钥会使绑定它的身份签名失效"
+    );
+}

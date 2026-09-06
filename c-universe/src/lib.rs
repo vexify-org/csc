@@ -14,6 +14,7 @@
 pub mod crypto;
 pub mod handshake;
 pub mod packet;
+pub mod pki;
 pub mod receiver;
 pub mod sender;
 
