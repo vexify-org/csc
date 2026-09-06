@@ -53,12 +53,17 @@ pub enum HandshakeError {
 }
 
 /// 握手帧长度（字节）：
-/// `version(1) || capabilities(1) || public_key(32) || salt(32) || authenticator(32)`。
-pub const HANDSHAKE_FRAME_LEN: usize = 98;
-/// 握手帧中 DH 公钥的起始偏移（version + capabilities 之后）。
-pub const PUBLIC_KEY_OFFSET: usize = 2;
+/// `version(1) || capabilities(1) || psk_id(1) || public_key(32) || salt(32) || authenticator(32)`。
+pub const HANDSHAKE_FRAME_LEN: usize = 99;
+/// 握手帧中预共享身份密钥版本号的偏移（版本 + 能力之后）。
+///
+/// PSK 轮换：帧携带发送方所用 PSK 的版本 ID，接收方据此在密钥环中选取同版本 PSK 验证，
+/// 未知版本一律拒绝 —— 一根 PSK 泄露或被吊销后，两端更换密钥环即可整体轮换，无需求样整个信任体系。
+pub const PSK_ID_OFFSET: usize = 2;
+/// 握手帧中 DH 公钥的起始偏移（version + capabilities + psk_id 之后）。
+pub const PUBLIC_KEY_OFFSET: usize = 3;
 /// 握手帧中盐的起始偏移（公钥结束）。
-pub const SALT_OFFSET: usize = 34;
+pub const SALT_OFFSET: usize = 35;
 /// 握手帧尾部 32 字节身份认证器（Key-Confirmation）。
 pub const AUTH_OFFSET: usize = SALT_OFFSET + 32;
 /// 身份认证器长度（字节）。
@@ -97,7 +102,7 @@ impl Role {
 /// 预共享身份密钥（32 字节长期身份），用于握手 **Key-Confirmation**。
 ///
 /// 两端的部署方预先共享同一把身份密钥（带外分发 / 秘钥管理服务）。每次 `negotiate`
-/// 都会在握手帧尾部附加 `HMAC-SHA256(identity, ...)` 认证器，接收方用同一把密钥
+/// 都会在握手帧尾部附加 `HMAC-SHA256(AUTHK, ...)` 认证器，接收方用同一把密钥
 /// 重算并做常数时间对比。由此：
 ///
 /// - **身份认证**：只有持有该密钥的主体才能产出有效认证器，双方相互证实「确实与
@@ -105,6 +110,15 @@ impl Role {
 ///   认证器的握手帧。
 /// - **完整性**：帧内任何一字节被篡改（代理改写版本/能力/公钥/盐）都会使重算结果
 ///   失配，会话被拒。
+///
+/// # PSK 泄露防护（三项加固）
+///
+/// 1. **密码学加固**：PSK **从不直接作为 HMAC 密钥**。认证密钥
+///    `AUTHK = HKDF-SHA256(IKM=PSK, salt=发送方会话盐)` 由 [`crypto::derive_auth_key`]
+///    逐握手派生（见 [`crypto::AUTH_KEY_INFO`]），PSK 仅作 HKDF 输入，缩小暴露面且跨会话不复用。
+/// 2. **生命周期/轮换**：PSK 带版本号，握手帧携带 `psk_id`；[`IdentityKeyRing`] 支持
+///    部署一组版本化 PSK，一根泄露/吊销后可整体轮换而无需重建信任体系。
+/// 3. **内存加固**：`Drop` 时以 [`zeroize`] 擦除明文，降低从核心转储/内存残留中被捞走的风险。
 ///
 /// # 安全分发（务必遵守）
 ///
@@ -114,12 +128,17 @@ impl Role {
 ///   等**带外**渠道分发，任何一端在接入网络前就已持有。严禁通过不可信信道传输。
 /// - **配置文件使用环境变量注入**：配置/部署清单中只写**引用占位符**（如
 ///   `C_UNIVERSE_IDENTITY_KEY`），密钥值**仅存在于运行环境**，不入源码库、不落盘明文、
-///   不打进镜像层。生产建议用 [`IdentityKey::from_env`] 启动时注入。
+///   不打进镜像层。生产建议用 [`IdentityKey::from_env`] / [`IdentityKeyRing::from_env`] 启动时注入。
 /// - 明文仅在进程内存瞬时持有；`Debug`/`bytes` 绝不打印，杜绝落日志。
 ///
 /// `Debug` 实现绝不打印密钥内容。
 #[derive(Clone)]
-pub struct IdentityKey([u8; 32]);
+pub struct IdentityKey {
+    /// PSK 版本号（用于轮换时在密钥环中定位；默认 0）。
+    version: u8,
+    /// 32 字节身份密钥明文（`Drop` 时擦除）。
+    secret: [u8; 32],
+}
 
 impl std::fmt::Debug for IdentityKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,19 +146,46 @@ impl std::fmt::Debug for IdentityKey {
     }
 }
 
+/// 内存加固：身份密钥销毁时立即擦除，防止明文残留在堆/栈、核心转储或内存抓取中。
+impl Drop for IdentityKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
+}
+
 impl IdentityKey {
-    /// 从一个确定的 32 字节秘密构造身份密钥（部署时注入）。
+    /// 从一个确定的 32 字节秘密构造版本 0 的身份密钥（部署时注入）。
     pub fn new(secret: &[u8; 32]) -> Self {
-        IdentityKey(*secret)
+        IdentityKey {
+            version: 0,
+            secret: *secret,
+        }
     }
 
-    /// 生成一把全新随机身份密钥 —— 仅用于部署引导 / 测试；生产应使用固定配置。
+    /// 以指定版本号 + 32 字节秘密构造身份密钥（版本化 PSK，用于轮换）。
+    pub fn new_v(version: u8, secret: &[u8; 32]) -> Self {
+        IdentityKey {
+            version,
+            secret: *secret,
+        }
+    }
+
+    /// 生成一把全新随机身份密钥（版本 0）—— 仅用于部署引导 / 测试；生产应使用固定配置。
     pub fn generate() -> Self {
         let b = random_bytes_32();
-        IdentityKey(b)
+        IdentityKey {
+            version: 0,
+            secret: b,
+        }
     }
 
-    /// 从环境变量 `var` 启动时注入 hex 编码的 32 字节身份密钥（**生产推荐**分发方式）。
+    /// 本 PSK 的版本号。
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// 从环境变量 `var` 启动时注入 hex 编码的 32 字节身份密钥（版本 0，**生产推荐**分发方式）。
     ///
     /// 部署方在带外生成密钥 → 以 hex（64 个十六进制字符）写入部署环境变量 →
     /// 程序启动时调用本函数读取并注入。密钥只存在于运行环境，吻合「配置文件用环境变量
@@ -162,12 +208,112 @@ impl IdentityKey {
         }
         let mut b = [0u8; 32];
         b.copy_from_slice(&bin);
-        Some(IdentityKey(b))
+        Some(IdentityKey {
+            version: 0,
+            secret: b,
+        })
     }
 
     /// 取明文（仅限内部与必要处使用，切勿日志输出）。
     pub(crate) fn bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.secret
+    }
+}
+
+/// 版本化预共享身份密钥环（生命周期 / 轮换）。
+///
+/// 部署方可将多个版本的身份密钥一次性注入（KMS / 编排 secret），握手时按帧内 `psk_id`
+/// 选取同版本 PSK 验证。切换版本只改密钥环，不动协议与代码：
+///
+/// - **轮换**：预发送一把新版本 PSK，两端更新部署密钥环即可切换到新 PSK；
+/// - **吊销**：从密钥环移除旧版本 → 旧帧将因[`HandshakeError::AuthenticationFailed`]
+///   被拒绝，泄露的旧 PSK 立即失去效力，无需重建整个会话信任体系。
+pub struct IdentityKeyRing {
+    keys: Vec<IdentityKey>,
+}
+
+impl std::fmt::Debug for IdentityKeyRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.keys.iter().map(|k| k.version()))
+            .finish()
+    }
+}
+
+impl Default for IdentityKeyRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdentityKeyRing {
+    /// 构造空密钥环。
+    pub fn new() -> Self {
+        IdentityKeyRing { keys: Vec::new() }
+    }
+
+    /// 插入一把版本化 PSK。同版本已存在则覆盖（最新为准）。
+    pub fn insert(&mut self, key: IdentityKey) {
+        if let Some(existing) = self.keys.iter_mut().find(|k| k.version() == key.version()) {
+            *existing = key;
+            return;
+        }
+        self.keys.push(key);
+    }
+
+    /// 按版本号查找 PSK；不存在返回 `None`。
+    pub fn lookup(&self, version: u8) -> Option<&IdentityKey> {
+        self.keys.iter().find(|k| k.version() == version)
+    }
+
+    /// 已配置的版本号集合（顺序不保证）。
+    pub fn versions(&self) -> impl Iterator<Item = u8> + '_ {
+        self.keys.iter().map(|k| k.version())
+    }
+
+    /// 密钥环中 PSK 数量。
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// 从环境变量 `var` 启动时注入**一组版本化 PSK**，格式：
+    /// `"<version>:<64-hex>,<version>:<64-hex>,..."`（如 `"1:ab..ff,2:00..11"`）。
+    ///
+    /// 生产推荐用本函数承载多版本轮换 —— 只改部署 env 即可切换/吊销 PSK，代码与协议不变。
+    /// 返回 `None`：变量未设置、任一表项格式非法，或环为空。
+    ///
+    /// ```
+    /// use c_universe::handshake::IdentityKeyRing;
+    /// let ring = IdentityKeyRing::from_env("C_UNIVERSE_ABSENT_ZZZ");
+    /// assert!(ring.is_none(), "示例环境无该变量 → 返回 None 符合预期");
+    /// ```
+    pub fn from_env(var: &str) -> Option<Self> {
+        let raw = std::env::var(var).ok()?;
+        let mut ring = IdentityKeyRing::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (version_s, hex) = part.split_once(':')?;
+            let version: u8 = version_s.trim().parse().ok()?;
+            let bin = decode_hex(hex.trim())?;
+            if bin.len() != 32 {
+                return None;
+            }
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&bin);
+            ring.insert(IdentityKey::new_v(version, &b));
+        }
+        if ring.is_empty() {
+            return None;
+        }
+        Some(ring)
     }
 }
 
@@ -228,11 +374,12 @@ impl DhKeyPair {
     }
 
     /// 派生出待发送的握手帧 =
-    /// `version(1) || capabilities(1) || public_key(32) || salt(32) || authenticator(32)`。
+    /// `version(1) || capabilities(1) || psk_id(1) || public_key(32) || salt(32) || authenticator(32)`。
     ///
-    /// 帧头携带协议版本与能力位图，使对端能在派生密钥前进行能力协商；尾部附加
-    /// 基于预共享身份密钥的 HMAC 认证器（Key-Confirmation），使对端能**认证我方身份**。
-    /// 缺失必需能力的对端将连接失败，而非静默降级（见 [`REQUIRED_CAPABILITIES`]）。
+    /// 帧头携带协议版本、能力位图与 **PSK 版本号**，使对端能在派生密钥前进行能力协商，
+    /// 按版本号在密钥环中定位同版本 PSK；尾部附加基于**逐握手派生认证密钥**的
+    /// HMAC 认证器（Key-Confirmation），使对端能**认证我方身份**。缺失必需能力的对端将
+    /// 连接失败，而非静默降级（见 [`REQUIRED_CAPABILITIES`]）。
     pub fn outbound_frame(
         &self,
         salt: &[u8; 32],
@@ -242,10 +389,13 @@ impl DhKeyPair {
         let mut f = [0u8; HANDSHAKE_FRAME_LEN];
         f[0] = PROTOCOL_VERSION;
         f[1] = CAP_DIRECTIONAL_KEYS;
+        f[PSK_ID_OFFSET] = identity.version();
         f[PUBLIC_KEY_OFFSET..SALT_OFFSET].copy_from_slice(&self.public);
         f[SALT_OFFSET..AUTH_OFFSET].copy_from_slice(salt);
+        // 密码学加固：PSK 不直接作 HMAC 密钥，先经 HKDF 派生逐握手独立的认证密钥。
+        let auth_key = crypto::derive_auth_key(identity.bytes(), salt);
         let auth = crypto::authenticate_frame(
-            identity.bytes(),
+            &auth_key,
             PROTOCOL_VERSION,
             CAP_DIRECTIONAL_KEYS,
             role.byte(),
@@ -299,13 +449,15 @@ pub fn parse_peer_frame(frame: &[u8]) -> Result<([u8; 32], [u8; 32]), HandshakeE
     Ok((peer_pub, peer_salt))
 }
 
-/// 对端握手帧的解析结果（含版本、能力位图与身份认证器）。
+/// 对端握手帧的解析结果（含版本、能力位图、PSK 版本与身份认证器）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandshakeFrame {
     /// 对端声明的协议版本。
     pub version: u8,
     /// 对端声明的能力位图。
     pub capabilities: u8,
+    /// 对端握手所用 PSK 的版本号（供轮换时在密钥环中定位）。
+    pub psk_id: u8,
     /// 对端 DH 公钥。
     pub peer_public: [u8; 32],
     /// 对端会话盐。
@@ -314,20 +466,17 @@ pub struct HandshakeFrame {
     pub authenticator: [u8; 32],
 }
 
-/// 解析对端握手帧，并执行 **版本 + 能力协商 + 身份认证**。
+/// 对一帧已找到对应 PSK 的握手帧执行 **版本 + 能力协商 + 身份认证**（核心实现）。
 ///
-/// 1. 长度校验（必须恰好 [`HANDSHAKE_FRAME_LEN`] 字节）；
-/// 2. 版本 / 能力协商：对端版本 ≠ [`PROTOCOL_VERSION`] 或能力缺少
-///    [`REQUIRED_CAPABILITIES`]（方向化密钥）→ [`HandshakeError::IncompatiblePeer`]，
-///    **拒绝降级**回单一 root 模式（允许跨方向重放，漏洞 F）；
-/// 3. **身份认证（漏洞：无身份认证）**：以预共享身份密钥 + `peer_role` 重算对端帧的
-///    HMAC 认证器，与帧内携带值做常数时间对比。失配一律 [`HandshakeError::AuthenticationFailed`]。
-///
-/// `local_role` 用于推导对端角色（Initiator↔Responder 互逆），并把该角色字节纳入
-/// 认证输入，绑定发送方的身份声明。
-pub fn parse_handshake_frame(
+/// 该私有函数不关心 PSK 版本如何解析，统一接收解析出的 PSK 明文与 `psk_id`：
+/// - 长度非 [`HANDSHAKE_FRAME_LEN`] → [`HandshakeError::BadPeerPayload`]；
+/// - 版本 / 能力缺失 → [`HandshakeError::IncompatiblePeer`]，拒绝降级；
+/// - **Key-Confirmation**：以「该 PSK 派生出的逐握手认证密钥」（AUTHK = HKDF(PSK, 对端盐)）
+///   重算对端帧认证器并与帧内值做常数时间对比，失配 → [`HandshakeError::AuthenticationFailed`]。
+fn verify_frame(
     frame: &[u8],
-    identity: &IdentityKey,
+    secret: &[u8; 32],
+    psk_id: u8,
     local_role: Role,
 ) -> Result<HandshakeFrame, HandshakeError> {
     if frame.len() != HANDSHAKE_FRAME_LEN {
@@ -340,6 +489,7 @@ pub fn parse_handshake_frame(
     let hf = HandshakeFrame {
         version: frame[0],
         capabilities: frame[1],
+        psk_id,
         peer_public: <[u8; 32]>::try_from(&frame[PUBLIC_KEY_OFFSET..SALT_OFFSET])
             .expect("slice is exactly 32 bytes"),
         peer_salt: <[u8; 32]>::try_from(&frame[SALT_OFFSET..AUTH_OFFSET])
@@ -356,9 +506,10 @@ pub fn parse_handshake_frame(
             required: REQUIRED_CAPABILITIES,
         });
     }
-    // Key-Confirmation：只有持有身份密钥的对端才能产出匹配的认证器。
+    // Key-Confirmation：PSK 经 HKDF 派生逐握手独立认证密钥，从不直接作 HMAC 密钥。
+    let auth_key = crypto::derive_auth_key(secret, &hf.peer_salt);
     let expected = crypto::authenticate_frame(
-        identity.bytes(),
+        &auth_key,
         hf.version,
         hf.capabilities,
         peer_role.byte(),
@@ -369,6 +520,54 @@ pub fn parse_handshake_frame(
         return Err(HandshakeError::AuthenticationFailed);
     }
     Ok(hf)
+}
+
+/// 解析对端握手帧，并执行 **版本 + 能力协商 + 身份认证**（单 PSK / 版本 0 便捷入口）。
+///
+/// 1. 长度校验（须至少能读到 [`PSK_ID_OFFSET`]，恰好 [`HANDSHAKE_FRAME_LEN`] 校验由
+///    [`verify_frame`] 完成）；
+/// 2. 帧内 `psk_id` 必须等于本端持有 PSK 的版本号，否则
+///    [`HandshakeError::AuthenticationFailed`]（本端未配置该版本 PSK）；
+/// 3. 版本 / 能力协商 + Key-Confirmation 身份认证（见 [`verify_frame`]）。
+///
+/// `local_role` 用于推导对端角色（Initiator↔Responder 互逆），并把该角色字节纳入
+/// 认证输入，绑定发送方的身份声明。
+pub fn parse_handshake_frame(
+    frame: &[u8],
+    identity: &IdentityKey,
+    local_role: Role,
+) -> Result<HandshakeFrame, HandshakeError> {
+    if frame.len() < HANDSHAKE_FRAME_LEN {
+        return Err(HandshakeError::BadPeerPayload(frame.len()));
+    }
+    let psk_id = frame[PSK_ID_OFFSET];
+    if psk_id != identity.version() {
+        // 本端只持有这一把 PSK，而对端用了不同版本 → 版本失配，拒绝。
+        return Err(HandshakeError::AuthenticationFailed);
+    }
+    verify_frame(frame, identity.bytes(), psk_id, local_role)
+}
+
+/// 解析对端握手帧并执行 **版本 + 能力协商 + 身份认证**，支持**多版本 PSK 密钥环**（轮换）。
+///
+/// 依据帧内 `psk_id` 在密钥环中定位同版本 PSK：
+/// - 密钥环中无该版本（如旧 PSK 已被吊销）→ [`HandshakeError::AuthenticationFailed`]；
+/// - 命中则用该 PSK 执行 Key-Confirmation（见 [`verify_frame`]）。
+///
+/// 部署方通过 [`IdentityKeyRing::from_env`] 注入一组版本化 PSK；切换/吊销只改密钥环即可。
+pub fn parse_handshake_frame_from_ring(
+    frame: &[u8],
+    ring: &IdentityKeyRing,
+    local_role: Role,
+) -> Result<HandshakeFrame, HandshakeError> {
+    if frame.len() < HANDSHAKE_FRAME_LEN {
+        return Err(HandshakeError::BadPeerPayload(frame.len()));
+    }
+    let psk_id = frame[PSK_ID_OFFSET];
+    let key = ring
+        .lookup(psk_id)
+        .ok_or(HandshakeError::AuthenticationFailed)?;
+    verify_frame(frame, key.bytes(), psk_id, local_role)
 }
 
 /// RFC 7748：拒绝全零共享密钥，避免低阶点注入弱密钥。

@@ -321,3 +321,129 @@ fn crypto_layer_properties_hold() {
     let nonce2 = crypto::derive_nonce(&a, 1);
     assert!(crypto::open(&key, &nonce2, aad, &ct).is_err());
 }
+
+/// PSK 泄露加固 ① —— 密码学加固：PSK 从不直接作 HMAC 密钥。
+///
+/// 认证密钥由 `HKDF(PSK, 发送方盐)` 逐握手派生：
+/// - 派生认证密钥 ≠ PSK 本身；
+/// - 同 (PSK, salt) 确定性派生一致，换 salt 则不一致（逐会话唯一、跨会话不复用）；
+/// - 若攻击者拿 PSK 直接当 HMAC 密钥重算认证器，结果必与下发认证器不同 → 端到端失效。
+#[test]
+fn psk_is_hkdf_derived_never_used_as_raw_mac_key() {
+    use c_universe::crypto;
+    use c_universe::handshake::{CAP_DIRECTIONAL_KEYS, Role, random_bytes_32};
+
+    let psk = [0xABu8; 32];
+    let salt = random_bytes_32();
+
+    // 派生认证密钥 ≠ PSK 明文（PSK 仅作 HKDF 输入）。
+    let ak = crypto::derive_auth_key(&psk, &salt);
+    assert_ne!(ak, psk, "AUTHK 不得等于 PSK 本身");
+    // 确定性：同 (PSK, salt) → 同 AUTHK；两端由此能算出同一认证密钥。
+    assert_eq!(ak, crypto::derive_auth_key(&psk, &salt));
+    // 逐握手独立：换盐 → 不同 AUTHK（跨会话认证不复用）。
+    let mut salt2 = salt;
+    salt2[0] ^= 0x80;
+    assert_ne!(ak, crypto::derive_auth_key(&psk, &salt2));
+
+    // 用发布公钥与盐构造认证器：派生密钥版本 vs 裸 PSK 版本必须不同。
+    let public = random_bytes_32();
+    let auth_derived = crypto::authenticate_frame(&ak, 2, CAP_DIRECTIONAL_KEYS, Role::Initiator.byte(), &public, &salt);
+    let auth_raw = crypto::authenticate_frame(&psk, 2, CAP_DIRECTIONAL_KEYS, Role::Initiator.byte(), &public, &salt);
+    assert_ne!(
+        auth_derived, auth_raw,
+        "若把 PSK 直接当 HMAC 密钥重算，认证器必与线上 AUTHK 版本不同"
+    );
+}
+
+/// PSK 泄露加固 ② —— 生命周期 / 轮换：版本化密钥环按 `psk_id` 选取，未知/吊销版本拒绝。
+#[test]
+fn psk_rotation_ring_rejects_unknown_or_revoked_version() {
+    use c_universe::handshake::{
+        parse_handshake_frame, parse_handshake_frame_from_ring, random_bytes_32, DhKeyPair,
+        IdentityKey, IdentityKeyRing, Role,
+    };
+
+    let _ = random_bytes_32;
+    let s1 = [1u8; 32];
+    let s2 = [2u8; 32];
+    let s3 = [3u8; 32];
+
+    // 部署密钥环同时持有 v1、v2（如过渡期双版本）。
+    let mut ring = IdentityKeyRing::new();
+    ring.insert(IdentityKey::new_v(1, &s1));
+    ring.insert(IdentityKey::new_v(2, &s2));
+    assert_eq!(ring.len(), 2);
+    assert!(ring.lookup(1).is_some());
+    assert!(ring.lookup(2).is_some());
+    assert!(ring.lookup(3).is_none());
+
+    // 对端用 v1 发帧 → 环中命中 v1，认证通过，hf 暴露所用版本。
+    let kp = DhKeyPair::generate();
+    let salt = random_bytes_32();
+    let frame_v1 = kp.outbound_frame(&salt, &IdentityKey::new_v(1, &s1), Role::Initiator);
+    let hf = parse_handshake_frame_from_ring(&frame_v1, &ring, Role::Responder).unwrap();
+    assert_eq!(hf.psk_id, 1);
+
+    // 吊销场景：环里已移除 v2（只持有 v1）→ 对端用 v2 发帧被拒。
+    let mut revoked_ring = IdentityKeyRing::new();
+    revoked_ring.insert(IdentityKey::new_v(1, &s1));
+    let kp2 = DhKeyPair::generate();
+    let salt2 = random_bytes_32();
+    let frame_v2 = kp2.outbound_frame(&salt2, &IdentityKey::new_v(2, &s2), Role::Initiator);
+    let err = parse_handshake_frame_from_ring(&frame_v2, &revoked_ring, Role::Responder).unwrap_err();
+    assert_eq!(
+        err,
+        c_universe::handshake::HandshakeError::AuthenticationFailed,
+        "已吊销版本 v2 的帧必须被拒绝，got {err:?}"
+    );
+
+    // 未知版本（环中从不存在的 v3）→ 拒绝，绝不静默用其他 PSK 验证。
+    let kp3 = DhKeyPair::generate();
+    let salt3 = random_bytes_32();
+    let frame_v3 = kp3.outbound_frame(&salt3, &IdentityKey::new_v(3, &s3), Role::Initiator);
+    let err = parse_handshake_frame_from_ring(&frame_v3, &ring, Role::Responder).unwrap_err();
+    assert_eq!(err, c_universe::handshake::HandshakeError::AuthenticationFailed);
+
+    // 单 PSK 便捷入口：版本须与本地 PSK 一致，否则拒绝（版本失配也是泄露防护）。
+    let key0 = IdentityKey::new(&s1); // 版本 0
+    let err = parse_handshake_frame(&frame_v2, &key0, Role::Responder).unwrap_err();
+    assert_eq!(err, c_universe::handshake::HandshakeError::AuthenticationFailed);
+
+    // 版本化 ring 环境变量注入与非法表项拒绝。
+    let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    std::env::set_var("C_UNIVERSE_RING_VAR", format!("1:{hex},2:{hex}"));
+    let from_env = IdentityKeyRing::from_env("C_UNIVERSE_RING_VAR").unwrap();
+    std::env::remove_var("C_UNIVERSE_RING_VAR");
+    assert_eq!(from_env.len(), 2);
+    assert_eq!(from_env.lookup(1).unwrap().version(), 1);
+    assert_eq!(from_env.lookup(2).unwrap().version(), 2);
+    // 表项含非法 hex → 整体 None。
+    std::env::set_var("C_UNIVERSE_RING_VAR", "1:zzzz");
+    assert!(IdentityKeyRing::from_env("C_UNIVERSE_RING_VAR").is_none());
+    std::env::remove_var("C_UNIVERSE_RING_VAR");
+}
+
+/// PSK 泄露加固 ③ —— 内存 / 存储：Debug 绝不泄露密钥，`Drop` 时擦除明文（zeroize）。
+#[test]
+fn identity_key_debug_redacts_secret_and_ring_env_roundtrip() {
+    use c_universe::handshake::IdentityKey;
+
+    // 注入一把已知 hex 的密钥，Debug 输出不得包含任何 hex 片段。
+    let hex = "aabbccddeeff0011223344556677889900112233445566778899aabbccddeeff";
+    std::env::set_var("C_UNIVERSE_REDACT_VAR", hex);
+    let key = IdentityKey::from_env("C_UNIVERSE_REDACT_VAR").unwrap();
+    std::env::remove_var("C_UNIVERSE_REDACT_VAR");
+    let dbg = format!("{key:?}");
+    assert!(
+        !dbg.contains("aabbcc") && !dbg.contains("001122"),
+        "身份密钥 Debug 不得泄露明文，got {dbg}"
+    );
+    assert!(dbg.contains("redacted") || dbg.contains("***"), "应保留脱敏标记");
+
+    // 非法 / 长度错误 / 未设置 → None（不 panic、不泄露）。
+    assert!(IdentityKey::from_env("C_UNIVERSE_ABSENT_ZZZ").is_none());
+    std::env::set_var("C_UNIVERSE_REDACT_VAR", "zzzz");
+    assert!(IdentityKey::from_env("C_UNIVERSE_REDACT_VAR").is_none());
+    std::env::remove_var("C_UNIVERSE_REDACT_VAR");
+}

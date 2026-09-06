@@ -31,6 +31,12 @@ pub const DIR_ROOT_RESPONDER_TO_INITIATOR: &[u8] =
 ///
 /// 独立于 KDF 的 info，避免与根种子 / 包密钥派生共用标签。
 pub const AUTH_INFO: &[u8] = b"C-Universe-Session-Auth-v1.3";
+/// 由 PSK 派生「每次握手独立认证密钥」的域分离标签（密码学加固：PSK 不直接作 MAC 密钥）。
+///
+/// `AUTHK = HKDF-SHA256(IKM=PSK, salt=发送方会话盐, info=AUTH_KEY_INFO)`。PSK 只作为
+/// HKDF 的输入密钥材料（IKM），**从不直接被当作 HMAC 密钥使用**；每次握手发送方盐随机，
+/// 故 AUTHK 逐握手唯一，缩小 PSK 在使用面上的暴露。
+pub const AUTH_KEY_INFO: &[u8] = b"C-Universe-PSK->AuthKey-v1.4.1";
 /// KeyUpdate 单向密钥棘轮的域分离标签。
 ///
 /// 每次 `key_update` 用 `HKDF-SHA256(IKM=当前根种子, salt=新一代序号, info=UPDATE_INFO)`
@@ -57,21 +63,23 @@ pub const NONCE_PREFIX_INFO: &[u8] = b"C-Universe-Nonce-Prefix-v1.4.1";
 
 /// 对握手帧内容做身份认证（Key-Confirmation）。
 ///
-/// 返回 `HMAC-SHA256(key = identity, msg = AUTH_INFO ‖ version‖capabilities‖role ‖ public ‖ salt)`
-/// 的 32 字节认证器。发送方将其附加在握手帧尾部，接收方用**同一把预共享身份密钥**
-/// 重算并与帧内携带值做常数时间对比 —— 只有持有该身份密钥的对端才能产出有效的认证器，
-/// 从而在 `negotiate` 内就把「无身份认证」的 MITM 关死：未知身份密钥的攻击者
-/// 无法提交带有效认证器的握手帧。
+/// 返回 `HMAC-SHA256(key = auth_key, msg = AUTH_INFO ‖ version‖capabilities‖role ‖ public ‖ salt)`
+/// 的 32 字节认证器。发送方将其附加在握手帧尾部，接收方用**同一把**握手认证密钥
+/// 重算并与帧内携带值做常数时间对比 —— 只有持有该预共享身份密钥的对端才能推导出这把
+/// 认证密钥并产出有效认证器，从而在 `negotiate` 内就把「无身份认证」的 MITM 关死。
+///
+/// `auth_key` **不是** PSK 本身，而是由 [`derive_auth_key`] 从 PSK + 发送方会话盐派生的
+/// 逐握手独立密钥：PSK 从不直接作为 HMAC 密钥上线，缩小其在密码面/审计面上的暴露。
 pub fn authenticate_frame(
-    identity: &[u8; KEY_LEN],
+    auth_key: &[u8; KEY_LEN],
     version: u8,
     capabilities: u8,
     role: u8,
     public: &[u8; KEY_LEN],
     salt: &[u8; KEY_LEN],
 ) -> [u8; KEY_LEN] {
-    // HMAC-SHA256 接受任意长度密钥；32 字节身份密钥必然合法。
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(identity)
+    // HMAC-SHA256 接受任意长度密钥；32 字节认证密钥必然合法。
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_key)
         .expect("HMAC accepts any key length");
     mac.update(AUTH_INFO);
     mac.update(&[version, capabilities, role]);
@@ -80,6 +88,20 @@ pub fn authenticate_frame(
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(&tag[..KEY_LEN]);
+    out
+}
+
+/// 由预共享身份密钥 PSK + 发送方会话盐派生**逐握手独立**的认证密钥 `AUTHK`。
+///
+/// `AUTHK = HKDF-SHA256(IKM = PSK, salt = 发送方盐, info = AUTH_KEY_INFO)`。
+/// PSK 仅作为 HKDF 输入密钥材料（extract 步骤），不会以明文形式直接出现在握手认证面；
+/// 发送方用**自己**生成的盐、接收方用**帧内携带的对方盐**，两者得到同一 AUTHK。
+/// 盐逐握手随机 → AUTHK 逐握手唯一，跨会话认证器不复用。
+pub fn derive_auth_key(identity: &[u8; KEY_LEN], salt: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), identity);
+    let mut out = [0u8; KEY_LEN];
+    hk.expand(AUTH_KEY_INFO, &mut out)
+        .expect("32 bytes always fits HKDF-SHA256");
     out
 }
 
