@@ -77,7 +77,7 @@ impl Packet {
         }
         .to_bytes();
         let key = crypto::derive_packet_key(root_seed, coord);
-        let nonce = crypto::coord_to_nonce(coord);
+        let nonce = crypto::derive_nonce(root_seed, coord);
         let ct = crypto::seal(&key, &nonce, &true_header, payload);
 
         // 头部保护：用受 AEAD 保护的密文前缀样本派生 8 字节掩码，掩盖 coord。
@@ -163,7 +163,7 @@ impl Packet {
 
         // 2) 派包密钥，以真头作 AAD 解密校验。
         let key = crypto::derive_packet_key(era_root, coord);
-        let nonce = crypto::coord_to_nonce(coord);
+        let nonce = crypto::derive_nonce(era_root, coord);
         let mut true_header = [0u8; HEADER_LEN];
         true_header[0] = PROTOCOL_VERSION;
         true_header[1..HEADER_LEN].copy_from_slice(&coord.to_be_bytes());

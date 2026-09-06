@@ -49,6 +49,11 @@ const HP_MASK_PREFIX: &[u8] = b"C-Universe-HP-Mask-v1.4";
 pub const HP_SAMPLE_LEN: usize = 16;
 /// AEAD nonce 长度（ChaCha20-Poly1305 标准 12 字节）。
 pub const NONCE_LEN: usize = 12;
+/// nonce 前缀派生的域分离标签。
+///
+/// 前缀取自方向根种子（HKDF 派生），使 `coord = 0` 的首包 nonce 非全零，
+/// 且不同会话（不同根种子）nonce 空间天然隔离，规避「全零 nonce + 固定后缀」的观感弱点。
+pub const NONCE_PREFIX_INFO: &[u8] = b"C-Universe-Nonce-Prefix-v1.4.1";
 
 /// 对握手帧内容做身份认证（Key-Confirmation）。
 ///
@@ -193,13 +198,23 @@ pub fn unmask_coord(masked: &[u8; 8], mask: &[u8; 8]) -> u64 {
     u64::from_be_bytes(c)
 }
 
-/// 由 coord 确定性派生每包唯一 nonce（4 字节零前缀 + 8 字节大端 coord）。
+/// 由方向根种子与 coord 确定性派生每包唯一 nonce（4 字节根派生前缀 + 8 字节大端 coord）。
 ///
-/// 因为同一 coord 只派生唯一密钥，且 coord 全局单向自增永不重复，
-/// 因此以 coord 为基构造的 nonce 对该密钥必然唯一，无需在报文中额外传输。
-pub fn coord_to_nonce(coord: u64) -> [u8; NONCE_LEN] {
+/// - **非全零前缀**：前缀由根种子经 HKDF 派生，`coord = 0` 的首包 nonce 亦非全零；
+///   不同会话（不同根种子）nonce 前缀互异，避免跨会话碰巧复用 identical 前缀的观感弱点。
+/// - **唯一性**：同方向根种子里 coord 全局单向自增永不重复，故 nonce 对该密钥必然唯一，
+///   无需在报文中额外传输。
+///
+/// 发送/接收均以同一 `era_root` 计算，天然一致。
+pub fn derive_nonce(era_root: &[u8; KEY_LEN], coord: u64) -> [u8; NONCE_LEN] {
+    // 4 字节前缀 = HKDF(era_root, info=NONCE_PREFIX_INFO)[..4]。
+    let hk = Hkdf::<Sha256>::new(None, era_root);
+    let mut pre = [0u8; 4];
+    hk.expand(NONCE_PREFIX_INFO, &mut pre)
+        .expect("4 bytes always fits HKDF-SHA256");
     let c = coord_to_be_bytes(coord);
     let mut nonce = [0u8; NONCE_LEN];
+    nonce[..4].copy_from_slice(&pre);
     nonce[NONCE_LEN - 8..].copy_from_slice(&c);
     nonce
 }

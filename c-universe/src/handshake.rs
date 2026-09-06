@@ -106,6 +106,17 @@ impl Role {
 /// - **完整性**：帧内任何一字节被篡改（代理改写版本/能力/公钥/盐）都会使重算结果
 ///   失配，会话被拒。
 ///
+/// # 安全分发（务必遵守）
+///
+/// > 身份密钥是**身份信任根**：它一旦泄露等于整个会话体系的信任崩塌。
+///
+/// - **带外安全渠道分发**：必须经秘钥管理服务（KMS / Vault / 1Password / 部署编排 secret）
+///   等**带外**渠道分发，任何一端在接入网络前就已持有。严禁通过不可信信道传输。
+/// - **配置文件使用环境变量注入**：配置/部署清单中只写**引用占位符**（如
+///   `C_UNIVERSE_IDENTITY_KEY`），密钥值**仅存在于运行环境**，不入源码库、不落盘明文、
+///   不打进镜像层。生产建议用 [`IdentityKey::from_env`] 启动时注入。
+/// - 明文仅在进程内存瞬时持有；`Debug`/`bytes` 绝不打印，杜绝落日志。
+///
 /// `Debug` 实现绝不打印密钥内容。
 #[derive(Clone)]
 pub struct IdentityKey([u8; 32]);
@@ -128,9 +139,62 @@ impl IdentityKey {
         IdentityKey(b)
     }
 
+    /// 从环境变量 `var` 启动时注入 hex 编码的 32 字节身份密钥（**生产推荐**分发方式）。
+    ///
+    /// 部署方在带外生成密钥 → 以 hex（64 个十六进制字符）写入部署环境变量 →
+    /// 程序启动时调用本函数读取并注入。密钥只存在于运行环境，吻合「配置文件用环境变量
+    /// 注入、不入库不落盘」的安全分发要求（见 [`IdentityKey`] 文档）。
+    ///
+    /// 返回 `None`：变量未设置，或值不是合法的 64 个十六进制字符。
+    ///
+    /// ```
+    /// // 部署示例（等价于 shell 里：export C_UNIVERSE_IDENTITY_KEY=<64 hex>）
+    /// use c_universe::handshake::IdentityKey;
+    /// let key = IdentityKey::from_env("C_UNIVERSE_IDENTITY_KEY");
+    /// assert!(key.is_none(), "示例环境无该变量 → 返回 None 符合预期");
+    /// ```
+    pub fn from_env(var: &str) -> Option<Self> {
+        let hex = std::env::var(var).ok()?;
+        let bin = decode_hex(&hex)?;
+        // 身份密钥必须恰好 32 字节（64 个十六进制字符）。
+        if bin.len() != 32 {
+            return None;
+        }
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&bin);
+        Some(IdentityKey(b))
+    }
+
     /// 取明文（仅限内部与必要处使用，切勿日志输出）。
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// 将十六进制字符串解码为字节（身份密钥环境变量注入用）。
+///
+/// 仅接受偶数长度的十六进制；非十六进制字符或长度非偶返回 `None`。
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 2);
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+/// 单个十六进制字符 → 数值（0-15）；非法字符返回 `None`。
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -324,6 +388,24 @@ pub fn random_bytes_32() -> [u8; 32] {
 /// 实现方负责：在 QUIC（TLS1.3）连接上通过可靠流交换 [`HANDSHAKE_FRAME_LEN`] 字节握手帧。
 /// QUIC 自带重传，握手包缺失被可靠承载，恰好满足白皮书“握手可靠性、抗丢包”的要求。
 /// **身份认证由 [`negotiate`] 内的 Key-Confirmation 强制执行**，本 trait 不承担也不可绕过。
+///
+/// # ⚠️ 传输通道必须使用 TLS
+///
+/// > **本 trait 的落地实现必须承载在 QUIC-TLS1.3（或等价 TLS1.3 流）之上，严禁裸跑明文
+/// > TCP 或去序传输。**
+///
+/// 原因：
+/// - **握手机密性**：X25519 DH 的公钥/共享秘密若在明文通道上交换，被动窃听者可截获
+///   DH 密钥材料；尽管身份认证（Key-Confirmation）能挡住「无身份密钥的 MITM」，却拦不住
+///   线上被动的数据面监听 —— 数据面虽为 AEAD 加密，但握手阶段隶属会话面包围，必须由
+///   TLS 提供传输层机密性与完整性。
+/// - **证书级身份（叠加）**：QUIC-TLS1.3 提供证书认证与握手完整性，作为 PSK
+///   Key-Confirmation 之上的第二道身份防线；一旦脱离 TLS，这道防线即消失而退化成
+///   仅依赖 PSK 的单点身份校验。
+/// - **抗降级与乱序**：TLS1.3 防降级、提供可靠有序语义，避免握手帧被中间层重排/注入。
+///
+/// 自检：若你的 `Transport` 实现不是建立在 `quinn` / `rustls` 等 TLS 栈之上，
+/// 应视为**不安全**，除非你同时把 PSK 身份认证作为唯一信任根且完全接受明文握手面的代价。
 pub trait Transport {
     type Error;
     /// 可靠写入（QUIC 提供的流语义）。

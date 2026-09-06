@@ -1,3 +1,6 @@
-fcfae4d2355f96792dd44e0330602324a8348dbeb82faa747a30218d9b018744  target/package/c-universe-1.4.0.crate
-cf8c50577f4e01e5f648d919aa76565cc3bd6b6416adc24354fa013dd2e7ff68  target/release/libc_universe.rlib
-9b1556eb0299b1c9512c07a0d042a1df80270760c79304cd1d7548ced1edd110  target/release/examples/chaos_demo
+# C-Universe v1.4.1 Release — SHA-256 (release artifacts)
+# Verify with: sha256sum -c hashes.txt
+# Binaries are build-platform specific; hashes below are for THIS build.
+5c4043fc4ec05948e6a3db47f47c209d5ad980c00171e0364a8db9629638ade6  target/package/c-universe-1.4.1.crate
+60f93b1a007ab1581604fde9fb418cefe939db6199826131a38d73a4eb0b502b  target/release/libc_universe.rlib
+9464e5947f4e956592ca7775f656c9a0e5e67a7e07723cc63a4b7c22029167d2  target/release/examples/chaos_demo

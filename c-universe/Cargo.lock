@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "c-universe"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "chacha20poly1305",
  "hkdf",

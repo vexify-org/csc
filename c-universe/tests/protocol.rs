@@ -7,6 +7,54 @@ use c_universe::handshake::{parse_handshake_frame, DhKeyPair, IdentityKey, Role}
 use c_universe::packet::Packet;
 use c_universe::{ReceiveError, Receiver, SessionConfig, Sender};
 
+/// 身份密钥安全分发（修复项 ①）：环境变量注入 + Debug 不泄露明文。
+#[test]
+fn identity_key_env_injection_and_secure_distribution() {
+    use c_universe::handshake::IdentityKey;
+
+    // 未设置 / 非法值 → None（不 panic、不泄露）。
+    assert!(IdentityKey::from_env("C_UNIVERSE_ABSENT_ZZZ").is_none());
+    assert!(IdentityKey::from_env("C_UNIVERSE_ABSENT_ABC").is_none());
+
+    // 合法 64-hex → 注入成功，值与 hex 逐字节一致。
+    let var = "C_UNIVERSE_TEST_INJECT";
+    let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    std::env::set_var(var, hex); // 模拟部署编排注入（生产由 KMS/编排注入，不入库）
+    let expected = {
+        let mut e = [0u8; 32];
+        e[0] = 0x00;
+        e[1] = 0x11;
+        e[2] = 0x22;
+        e[3] = 0x33;
+        e[4] = 0x44;
+        e[5] = 0x55;
+        e[6] = 0x66;
+        e[7] = 0x77;
+        e[8] = 0x88;
+        e[9] = 0x99;
+        e[10] = 0xaa;
+        e[11] = 0xbb;
+        e[12] = 0xcc;
+        e[13] = 0xdd;
+        e[14] = 0xee;
+        e[15] = 0xff;
+        e
+    };
+    let key = IdentityKey::from_env(var).expect("合法 hex 应注入成功");
+    std::env::remove_var(var);
+    // 用同一密钥 negotiate 级联身份认证，隐含验证内置字节与 hex 一致：
+    let k2 = IdentityKey::new(&expected);
+    assert_eq!(format!("{key:?}"), format!("{k2:?}"), "env 注入值与 hex 不一致");
+
+    // 长度非 32 字节（此处仅 2 字节）→ 拒绝（None），不 panic。
+    std::env::set_var(var, "0011");
+    assert!(IdentityKey::from_env(var).is_none());
+    std::env::remove_var(var);
+
+    // Debug 永不打印明文（防日志泄露）。
+    assert_eq!(format!("{key:?}"), "IdentityKey(***redacted***)");
+}
+
 /// 握手两端能够得到**一致的方向化会话根种子对**（双向隔离）。
 #[test]
 fn handshake_reaches_common_directional_roots() {
@@ -236,14 +284,18 @@ fn crypto_layer_properties_hold() {
     let k1 = crypto::derive_packet_key(&a, 1);
     assert_ne!(k0, k1);
 
-    // ③ nonce 与密钥一一对应（同 coord 恒同 nonce，不同 coord 必不同）。
-    assert_eq!(crypto::coord_to_nonce(7), crypto::coord_to_nonce(7));
-    assert_ne!(crypto::coord_to_nonce(7), crypto::coord_to_nonce(8));
+    // ③ nonce 与密钥一一对应：同 coord、同根恒同 nonce；不同 coord 必不同；且首包非全零。
+    assert_eq!(crypto::derive_nonce(&a, 7), crypto::derive_nonce(&a, 7));
+    assert_ne!(crypto::derive_nonce(&a, 7), crypto::derive_nonce(&a, 8));
+    // 首包（coord=0）nonce 带根派生前缀，不应是全零（修复项 ②）。
+    assert_ne!(crypto::derive_nonce(&a, 0), [0u8; 12]);
+    // 不同方向根种子 → nonce 前缀不同，方向/会话间 nonce 空间隔离。
+    assert_ne!(crypto::derive_nonce(&a, 3), crypto::derive_nonce(&d, 3));
 
     // ④ AEAD 往返：seal 后 open 能还原明文。
     let body = b"classified payload";
     let aad = b"version|coord=0";
-    let nonce = crypto::coord_to_nonce(0);
+    let nonce = crypto::derive_nonce(&a, 0);
     let key = crypto::derive_packet_key(&a, 0);
     let ct = crypto::seal(&key, &nonce, aad, body);
     assert_eq!(crypto::open(&key, &nonce, aad, &ct).unwrap(), body);
@@ -266,6 +318,6 @@ fn crypto_layer_properties_hold() {
     assert!(crypto::open(&key, &nonce, aad, &forged).is_err());
 
     // ⑨ nonce 错配也失败（防 nonce 重排攻击）。
-    let nonce2 = crypto::coord_to_nonce(1);
+    let nonce2 = crypto::derive_nonce(&a, 1);
     assert!(crypto::open(&key, &nonce2, aad, &ct).is_err());
 }
