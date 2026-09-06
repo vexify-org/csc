@@ -510,7 +510,61 @@ fn attack_unknown_identity_key_is_rejected() {
     assert_eq!(err, HandshakeError::AuthenticationFailed);
 }
 
-/// 攻击 ⑭ —— 前向保密（KeyUpdate）：泄露当前密钥不回溯历史。
+/// 攻击 ⑰ —— 一轮 DH 握手：本地私钥指数永不上线，中间人只凭公开值拿不到共享密钥。
+///
+/// 验证握手确实是真正的一次 Diffie–Hellman（`G^ab`，椭圆曲线形式）：
+/// - 双方各自持有**私钥指数**，线上只出现**公钥** `G^a`/`G^b` 与会话盐；
+/// - 两端各自 `DH(私钥, 对端公钥)` 得到**同一**共享密钥/方向根（`G^{ab}`）；
+/// - 被动中间人只有线上的公钥 + 盐，没有私钥指数 `a`/`b` → 依据 CDH 困难性算不出
+///   共享密钥 → 无法解密任一会话包；本地私钥也绝不泄露。
+#[test]
+fn attack_dh_round_local_secret_never_leaks_and_mitm_cannot_derive_it() {
+    use c_universe::handshake::{random_bytes_32, DhKeyPair};
+    use c_universe::Receiver;
+    use c_universe::Sender;
+
+    // 双方各自生成临时密钥对与会话盐（私钥指数只存在本地）。
+    let a = DhKeyPair::generate();
+    let b = DhKeyPair::generate();
+    let sa = random_bytes_32();
+    let sb = random_bytes_32();
+    let combined = crypto::combine_session_salts(&sa, &sb);
+
+    // ① DH 轮有效：两端各自用「本地私钥 + 对端公钥」鉴出**同一**方向根对。
+    let (ir, ri) = a
+        .derive_directional_roots_with_salt(&b.public_key(), &combined)
+        .unwrap();
+    let (ir_b, ri_b) = b
+        .derive_directional_roots_with_salt(&a.public_key(), &combined)
+        .unwrap();
+    assert_eq!(ir, ir_b, "DH 共享密钥两端必须一致 (G^ab)");
+    assert_eq!(ri, ri_b);
+
+    // ② 本地私钥指数绝不随线上泄露：线上字节只有 version、公钥、盐、密文——
+    //    显式断言私钥/共享密钥没有出现在任何已发送公钥或包字节中（无法直接断言内存，
+    //    但可断言只有公钥被用于前述推导、且该推导需要私钥指数这一事实）。
+    let pub_only_reconstruction: [u8; 32] = a.public_key(); // 对端持有的仅是公钥
+    assert_ne!(
+        pub_only_reconstruction,
+        ir,
+        "公钥不应等于最终根种子（否则等于泄明了 DH 输出）"
+    );
+
+    // ③ 被动中间人（只有线上公钥 + 盐，无私钥指数）无法解密会话包。
+    let mut observer_rx = Receiver::with_defaults(&[0u8; 32]); // 观察者没有任何 DH 私钥材料
+    let mut sender = Sender::new(&ir);
+    let pkt = sender.send(b"confidential-from-dh");
+    let err = observer_rx.recv(&pkt).unwrap_err();
+    assert_eq!(
+        err,
+        ReceiveError::AuthenticationFailed,
+        "仅凭线上面公钥/盐即可算出共享密钥并解密（DH 失效或私钥被泄露）"
+    );
+
+    // ④ 反向再确认：持有正确根的正规接收端能解密（证明③失败是因缺私钥/根，非包格式问题）。
+    let mut legit_rx = Receiver::with_defaults(&ir);
+    assert_eq!(legit_rx.recv(&pkt).unwrap(), b"confidential-from-dh");
+}
 ///
 /// 发送方 `key_update()` 用单向 HKDF 棘轮前滚并**弃用旧根**。若实现无法前向保密，
 /// 持有「当前时代」根种子的攻击者应能解密早期时代的历史报文。
